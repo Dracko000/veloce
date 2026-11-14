@@ -1,0 +1,6 @@
+module hello
+
+fn add_scale(a: i32, b: i32, s: f32) -> f32 {
+    let sum = a + b
+    return f32(sum) * s
+}

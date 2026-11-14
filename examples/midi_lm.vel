@@ -1,0 +1,94 @@
+module midi_lm
+
+dim V = 32000
+dim D = 1536
+dim F = 6144
+
+fn attn(q: f32[1, D], k: f32[1, D], v: f32[1, D]) -> f32[1, D] {
+    let kt = transpose(k)
+    let scores = matmul(q, kt)
+    let probs = softmax(scores * 0.0255)
+    return matmul(probs, v)
+}
+
+fn layer(x: f32[1, D], nw: f32[D],
+         wq: trit[D, D], wk: trit[D, D], wv: trit[D, D], wo: trit[D, D],
+         w1: trit[F, D], w2: trit[D, F], w3: trit[F, D]) -> f32[1, D] {
+    let xn = rmsnorm(x, nw)
+    let q = matmul_trit(xn, wq)
+    let k = matmul_trit(xn, wk)
+    let v = matmul_trit(xn, wv)
+    let a = attn(q, k, v)
+    let o = matmul_trit(a, wo)
+    let x1 = x + o
+    let xn2 = rmsnorm(x1, nw)
+    let g = matmul_trit(xn2, w1)
+    let u = matmul_trit(xn2, w3)
+    let h = silu(g) * u
+    let d = matmul_trit(h, w2)
+    return x1 + d
+}
+
+fn forward(
+    emb: fp16[V, D],
+    tok: i32,
+    nw1: f32[D],
+    wq1: trit[D, D],
+    wk1: trit[D, D],
+    wv1: trit[D, D],
+    wo1: trit[D, D],
+    w11: trit[F, D],
+    w21: trit[D, F],
+    w31: trit[F, D],
+    nw2: f32[D],
+    wq2: trit[D, D],
+    wk2: trit[D, D],
+    wv2: trit[D, D],
+    wo2: trit[D, D],
+    w12: trit[F, D],
+    w22: trit[D, F],
+    w32: trit[F, D],
+    nw3: f32[D],
+    wq3: trit[D, D],
+    wk3: trit[D, D],
+    wv3: trit[D, D],
+    wo3: trit[D, D],
+    w13: trit[F, D],
+    w23: trit[D, F],
+    w33: trit[F, D],
+    nw4: f32[D],
+    wq4: trit[D, D],
+    wk4: trit[D, D],
+    wv4: trit[D, D],
+    wo4: trit[D, D],
+    w14: trit[F, D],
+    w24: trit[D, F],
+    w34: trit[F, D],
+    nw5: f32[D],
+    wq5: trit[D, D],
+    wk5: trit[D, D],
+    wv5: trit[D, D],
+    wo5: trit[D, D],
+    w15: trit[F, D],
+    w25: trit[D, F],
+    w35: trit[F, D],
+    nw6: f32[D],
+    wq6: trit[D, D],
+    wk6: trit[D, D],
+    wv6: trit[D, D],
+    wo6: trit[D, D],
+    w16: trit[F, D],
+    w26: trit[D, F],
+    w36: trit[F, D],
+    nwf: f32[D],
+    head: trit[V, D]) -> f32[1, V] {
+    let x0 = embedding(emb, tok)
+    let x1 = layer(x0, nw1, wq1, wk1, wv1, wo1, w11, w21, w31)
+    let x2 = layer(x1, nw2, wq2, wk2, wv2, wo2, w12, w22, w32)
+    let x3 = layer(x2, nw3, wq3, wk3, wv3, wo3, w13, w23, w33)
+    let x4 = layer(x3, nw4, wq4, wk4, wv4, wo4, w14, w24, w34)
+    let x5 = layer(x4, nw5, wq5, wk5, wv5, wo5, w15, w25, w35)
+    let x6 = layer(x5, nw6, wq6, wk6, wv6, wo6, w16, w26, w36)
+    let xn = rmsnorm(x6, nwf)
+    return matmul_trit(xn, head)
+}

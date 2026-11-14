@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Veloce compiler test suite (stdlib unittest).
+
+Run:  python3 tests/test_compiler.py -v
+"""
+import os
+import struct
+import subprocess
+import sys
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import veloce  # noqa: E402
+from veloce import weights  # noqa: E402
+from veloce.errors import (  # noqa: E402
+    LexError, ParseError, TypeError_, SemanticError,
+)
+
+RUNTIME = os.path.join(ROOT, "runtime")
+CC = os.environ.get("CC", "cc")
+
+
+def build_and_run(vel_src, driver_src, extra_arrays="", name="t"):
+    """Compile a Veloce source + a C driver, link, run, return stdout."""
+    res = veloce.compile_source(vel_src, module_name=name)
+    cpath = f"/tmp/{name}.gen.c"
+    with open(cpath, "w") as f:
+        f.write(res.c_source)
+    drv = f"/tmp/{name}.drv.c"
+    with open(drv, "w") as f:
+        f.write('#include "veloce_runtime.h"\n#include <stdio.h>\n')
+        f.write(extra_arrays)
+        f.write("\n")
+        f.write(driver_src)
+    exe = f"/tmp/{name}.bin"
+    cmd = [CC, "-std=c11", "-O3", "-march=native", "-ffast-math",
+           "-I", RUNTIME, drv, cpath, "-lm", "-o", exe]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("compile failed:\n" + r.stderr + "\n--- C ---\n" + res.c_source)
+    r = subprocess.run([exe], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("run failed: " + r.stderr)
+    return r.stdout, res
+
+
+class TestFrontEnd(unittest.TestCase):
+    def test_lex(self):
+        toks = veloce.tokenize("fn f(a: i32) -> i32 { return a }\n")
+        kinds = [t.kind for t in toks]
+        self.assertIn("KW", kinds)
+        self.assertEqual(toks[-1].kind, "EOF")
+
+    def test_lex_error(self):
+        with self.assertRaises(LexError):
+            veloce.tokenize("let x = $")
+
+    def test_parse_fn(self):
+        mod = veloce.parse(veloce.tokenize(
+            "fn add(a: i32, b: i32) -> i32 { return a + b }\n"))
+        self.assertEqual(len(mod.functions), 1)
+        self.assertEqual(mod.functions[0].name, "add")
+
+    def test_parse_error(self):
+        with self.assertRaises(ParseError):
+            veloce.parse(veloce.tokenize("fn f( { }"))
+
+    def test_no_for_loops(self):
+        with self.assertRaises(ParseError):
+            veloce.compile_source("fn f() -> i32 { for x in y { } return 0 }")
+
+
+class TestSemantics(unittest.TestCase):
+    def test_undefined_var(self):
+        with self.assertRaises(SemanticError):
+            veloce.compile_source("fn f() -> i32 { return zzz }")
+
+    def test_shape_mismatch(self):
+        src = ("dim N = 4\n"
+               "fn f(a: f32[3,4], b: f32[2,4]) -> f32[3,4] { return a + b }")
+        with self.assertRaises(TypeError_):
+            veloce.compile_source(src)
+
+    def test_matmul_dim_mismatch(self):
+        src = ("dim A = 3\ndim B = 4\ndim C = 5\n"
+               "fn f(x: f32[A,B], w: f32[C,C]) -> f32[A,C] { return matmul(x, w) }")
+        with self.assertRaises(TypeError_):
+            veloce.compile_source(src)
+
+    def test_immutable_assign(self):
+        src = "fn f() -> i32 { const a = 1\n a = 2\n return a }"
+        with self.assertRaises(SemanticError):
+            veloce.compile_source(src)
+
+    def test_trit_matmul_requires_trit(self):
+        src = ("dim A = 2\ndim B = 3\n"
+               "fn f(x: f32[A,B], w: f32[B,B]) -> f32[A,B] { return matmul_trit(x, w) }")
+        with self.assertRaises(TypeError_):
+            veloce.compile_source(src)
+
+    def test_undeclared_dim(self):
+        with self.assertRaises(veloce.VeloceError):
+            veloce.compile_source("fn f(x: f32[Q, 4]) -> f32[Q,4] { return x }")
+
+
+class TestCodegen(unittest.TestCase):
+    def test_hello_runs(self):
+        src = ("fn add_scale(a: i32, b: i32, s: f32) -> f32 {\n"
+               "  let sum = a + b\n  return f32(sum) * s\n}\n")
+        out, _ = build_and_run(
+            src,
+            'extern float veloce_add_scale(int,int,float);\n'
+            'int main(void){ printf("%.3f\\n", veloce_add_scale(3,4,2.5)); return 0; }',
+            name="hello")
+        self.assertAlmostEqual(float(out.strip()), 17.5, places=4)
+
+    def test_if_while_multi_return(self):
+        src = ("fn count(n: i32) -> i32, i32 {\n"
+               "  let i = 0\n  let s = 0\n"
+               "  while i < n {\n    if i % 2 == 0 { s = s + i }\n    i = i + 1\n  }\n"
+               "  return s, i\n}\n")
+        out, _ = build_and_run(
+            src,
+            'extern void veloce_count(int,int*,int*);\n'
+            'int main(void){ int s,i; veloce_count(10,&s,&i);'
+            ' printf("%d %d\\n", s, i); return 0; }',
+            name="loop")
+        s, i = [int(v) for v in out.split()]
+        self.assertEqual((s, i), (0 + 2 + 4 + 6 + 8, 10))
+
+    def test_argmax(self):
+        src = ("dim N = 5\n"
+               "fn pick(x: f32[N]) -> i32 {\n  return argmax(x)\n}\n")
+        arr = "static float XV[5] = {0.1f, 3.2f, -1.0f, 7.5f, 2.0f};\n"
+        out, _ = build_and_run(
+            src,
+            'extern int veloce_pick(float*);\n'
+            'int main(void){ printf("%d\\n", veloce_pick(XV)); return 0; }',
+            extra_arrays=arr, name="argmax")
+        self.assertEqual(int(out.strip()), 3)
+
+    def test_arena_reuse_reduces_peak(self):
+        # A chain of same-shaped tensors should reuse one buffer.
+        src = ("dim N = 64\n"
+               "fn chain(a: f32[N], b: f32[N]) -> f32[N] {\n"
+               "  let x0 = a + b\n  let x1 = x0 + b\n  let x2 = x1 + b\n"
+               "  let x3 = x2 + b\n  let x4 = x3 + b\n  return x4\n}\n")
+        res = veloce.compile_source(src)
+        plan = res.memory["chain"]
+        rpt = plan.report()
+        self.assertGreater(rpt["reuse_savings_pct"], 40.0,
+                           f"expected strong reuse, got {rpt}")
+
+
+class TestPacking(unittest.TestCase):
+    def test_trit_roundtrip(self):
+        import random
+        random.seed(7)
+        vals = [random.choice([-1, 0, 1]) for _ in range(1000)]
+        packed = weights.pack_trits(vals)
+        back = weights.unpack_trits(packed, len(vals))
+        self.assertEqual(back, vals)
+
+    def test_i4_roundtrip(self):
+        import random
+        random.seed(11)
+        vals = [random.randint(-8, 7) for _ in range(1001)]
+        packed = weights.pack_i4(vals)
+        self.assertEqual(len(packed), (len(vals) + 1) // 2)
+        back = weights.unpack_i4(packed, len(vals))
+        self.assertEqual(back, vals)
+
+    def test_i4_pack_layout(self):
+        # low nibble first, sign-extended
+        self.assertEqual(list(weights.pack_i4([1, 2])), [0x21])
+        # low nibble first: -1 -> 0xF in low, -8 -> 0x8 in high => 0x8F
+        self.assertEqual(list(weights.pack_i4([-1, -8])), [0x8F])
+        self.assertEqual(list(weights.unpack_i4(bytes([0x21]), 2)), [1, 2])
+        self.assertEqual(list(weights.unpack_i4(bytes([0x8F]), 2)), [-1, -8])
+
+    def test_i4_matmul_codegen(self):
+        src = """module t
+dim M = 2
+dim K = 64
+dim N = 8
+fn f(x: f32[M, K], w: i4[N, K]) -> f32[M, N] {
+    let y = matmul_i4(x, w)
+    return relu(y)
+}
+"""
+        c = veloce.compile_source(src, module_name="t").c_source
+        self.assertIn("veloce_matmul_i4", c)
+
+    def test_trit_size(self):
+        vals = [1] * 1000
+        packed = weights.pack_trits(vals)
+        # 5 trits per byte -> 200 bytes (vs 1000 for int8, 2000 for fp16, 4000 f32)
+        self.assertEqual(len(packed), 200)
+
+    def test_matches_runtime_header(self):
+        # The C encoder's format must agree with Python's for a random vector.
+        import random
+        random.seed(3)
+        vals = [random.choice([-1, 0, 1]) for _ in range(50)]
+        packed = weights.pack_trits(vals)
+        cdecl = "static uint8_t P[%d] = {%s};\n" % (
+            len(packed), ",".join(str(b) for b in packed))
+        drv = ('extern int veloce_check(uint8_t*);\n'
+               'int main(void){ printf("%d\\n", veloce_check(P)); return 0; }\n')
+        # use a tiny veloce fn that unpacks via runtime and returns a checksum
+        src = ("dim N = 50\n"
+               "fn check(x: trit[N]) -> i32 {\n  return 0\n}\n")
+        # Instead of relying on a veloce fn we compile a C helper via the runtime
+        helper = ('#include "veloce_runtime.h"\n'
+                  'int veloce_check(uint8_t*p){ int s=0; int8_t tmp[50];'
+                  ' veloce_expand_trit(tmp,p,50); for(int i=0;i<50;i++) s+=tmp[i]*(i+1);'
+                  ' return s; }')
+        cpath = "/tmp/pk.helper.c"
+        with open(cpath, "w") as f:
+            f.write(helper)
+        drvpath = "/tmp/pk.drv.c"
+        with open(drvpath, "w") as f:
+            f.write('#include "veloce_runtime.h"\n#include <stdio.h>\n')
+            f.write(cdecl)
+            f.write(drv)
+        exe = "/tmp/pk.bin"
+        r = subprocess.run([CC, "-std=c11", "-O2", "-I", RUNTIME, cpath, drvpath,
+                            "-lm", "-o", exe], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = subprocess.run([exe], capture_output=True, text=True).stdout
+        expect = sum(v * (i + 1) for i, v in enumerate(vals))
+        self.assertEqual(int(out.strip()), expect)
+
+
+class TestVeloceFormat(unittest.TestCase):
+    def test_roundtrip(self):
+        import numpy as np
+        w = np.array([[-1, 0, 1], [1, 1, -1]], dtype=np.int8)
+        f = np.arange(6, dtype=np.float32).reshape(2, 3)
+        h = np.array([1.5, -2.25, 3.0], dtype=np.float16)
+        path = "/tmp/m.veloce"
+        weights.save_veloce(path, [("w", w, "trit"), ("f", f, "f32"), ("h", h, "fp16")])
+        vf = weights.VeloceFile(path)
+        try:
+            np.testing.assert_array_equal(vf.numpy("w"), w)
+            np.testing.assert_array_equal(vf.numpy("f"), f)
+            np.testing.assert_allclose(vf.numpy("h").astype(np.float32), h.astype(np.float32))
+            # zero-copy: raw returns a memoryview
+            self.assertIsInstance(vf.raw("w"), memoryview)
+        finally:
+            vf.close()
+
+    def test_alignment(self):
+        import numpy as np
+        path = "/tmp/al.veloce"
+        weights.save_veloce(path, [("a", np.zeros(10, dtype=np.float32), "f32"),
+                                   ("b", np.zeros(33, dtype=np.int8), "trit")])
+        vf = weights.VeloceFile(path)
+        try:
+            for e in vf.entries.values():
+                self.assertEqual(e["offset"] % 64, 0)
+        finally:
+            vf.close()
+
+    def test_model_card_roundtrip(self):
+        import numpy as np
+        from veloce import capabilities
+        path = "/tmp/mc.veloce"
+        card = capabilities.make_model_card(
+            "unit-test", params={"ternary": 64},
+            capabilities={"coding_agentic": {
+                "status": "trained",
+                "evidence": ["unit-test fixture"],
+            }})
+        weights.save_veloce(path, [("w", np.array([1, 0, -1], dtype=np.int8), "trit")],
+                            model_card=card)
+        vf = weights.VeloceFile(path)
+        try:
+            self.assertIsNotNone(vf.model_card)
+            self.assertEqual(vf.model_card["name"], "unit-test")
+            self.assertEqual(
+                vf.model_card["capabilities"]["coding_agentic"]["status"],
+                "trained")
+            # Untouched pillars stay conservatively declared.
+            self.assertEqual(
+                vf.model_card["capabilities"]["world_understanding"]["status"],
+                "declared")
+            capabilities.validate_model_card(vf.model_card)
+        finally:
+            vf.close()
+
+    def test_model_card_rejects_overclaim(self):
+        from veloce import capabilities
+        card = capabilities.make_model_card("bad")
+        card["capabilities"]["specialist_knowledge"] = {
+            "status": "verified", "evidence": []}
+        with self.assertRaises(ValueError):
+            capabilities.validate_model_card(card)
+        with self.assertRaises(ValueError):
+            capabilities.make_model_card(
+                "bad", capabilities={"not_a_pillar": {"status": "declared"}})
+        with self.assertRaises(ValueError):
+            capabilities.make_model_card(
+                "bad", capabilities={"coding_agentic": {"status": "maybe"}})
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

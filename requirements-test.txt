@@ -1,0 +1,6 @@
+# Test / example dependencies for Veloce.
+#
+# The compiler itself (velocec + veloce/) is pure Python stdlib. NumPy is only
+# needed by the verification suites and the training/transformer examples,
+# which use it as an independent reference implementation.
+numpy>=1.24

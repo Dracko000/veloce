@@ -1,0 +1,34 @@
+module tiny_lm
+
+# ---------------------------------------------------------------------------
+# A minimal decoder-style next-token predictor, used by demo/tiny_lm.
+#
+#   embedding  ->  RMSNorm  ->  Trit Linear (matmul-free)  ->  SiLU
+#              ->  Trit LM head  ->  argmax
+#
+# All weights except the embedding / norm are 1.58-bit ternary and stored
+# packed; the two linear layers lower to add/sub only.
+# ---------------------------------------------------------------------------
+
+dim V = 16
+dim D = 16
+dim F = 32
+
+fn next_token(emb: f32[V, D], nw: f32[D], w1: trit[F, D], w2: trit[V, F],
+              tok: i32) -> i32 {
+    let x = embedding(emb, tok)          # [1, D]
+    let xn = rmsnorm(x, nw)              # [1, D]
+    let h = matmul_trit(xn, w1)          # [1, F]  add/sub only
+    let a = silu(h)                      # [1, F]
+    let logits = matmul_trit(a, w2)      # [1, V]  add/sub only
+    return argmax(logits)
+}
+
+fn logits_of(emb: f32[V, D], nw: f32[D], w1: trit[F, D], w2: trit[V, F],
+             tok: i32) -> f32[1, V] {
+    let x = embedding(emb, tok)
+    let xn = rmsnorm(x, nw)
+    let h = matmul_trit(xn, w1)
+    let a = silu(h)
+    return matmul_trit(a, w2)
+}

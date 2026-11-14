@@ -1,0 +1,39 @@
+module tiny_lm_cls
+
+# ---------------------------------------------------------------------------
+# Tiny ternary topic-classifier, deployed by `examples/train_tiny_lm.py`.
+#
+# Shapes match the trainer exactly:
+#   V = vocabulary, T = sequence length, D = model width, F = ff width, K = classes
+#
+#   ids -> embedding_seq -> meanpool -> RMSNorm -> Trit Linear (matmul-free)
+#       -> Trit Linear (residual) -> RMSNorm -> Trit FFN (SiLU) -> residual
+#       -> Trit classifier head -> argmax
+#
+# Every matmul uses 1.58-bit ternary weights (packed, add/sub-only).  The
+# embedding table and the RMSNorm gain are the only float tensors.
+# ---------------------------------------------------------------------------
+
+dim V = 32
+dim T = 16
+dim D = 64
+dim F = 128
+dim K = 4
+
+fn predict_class(ids: i32[T], emb: f32[V, D], nw: f32[D],
+                 wq: trit[D, D], wo: trit[D, D], w1: trit[F, D], w2: trit[D, F],
+                 cls: trit[K, D]) -> i32 {
+    let e = embedding_seq(emb, ids)       # [T, D]
+    let x = meanpool(e)                   # [1, D]
+    let xn = rmsnorm(x, nw)               # [1, D]
+    let h = matmul_trit(xn, wq)           # [1, D]  add/sub only
+    let h2 = matmul_trit(h, wo)           # [1, D]
+    let x1 = x + h2                       # residual
+    let xn2 = rmsnorm(x1, nw)
+    let f1 = matmul_trit(xn2, w1)         # [1, F]
+    let a = silu(f1)                      # [1, F]
+    let f2 = matmul_trit(a, w2)           # [1, D]
+    let x2 = x1 + f2                      # residual
+    let logits = matmul_trit(x2, cls)     # [1, K]
+    return argmax(logits)
+}

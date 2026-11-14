@@ -1,0 +1,57 @@
+module transformer_block
+
+# ---------------------------------------------------------------------------
+# A single LLaMA-style transformer layer expressed in Veloce.
+#
+# Everything here is DECLARATIVE: there are no `for`/`while` loops in the
+# tensor code.  Sub-byte weights (trit = 1.58-bit ternary) are first-class
+# storage types; `matmul_trit` lowers to integer add/sub at codegen time.
+#
+# Shapes are symbolic (T = sequence length, D = model width, F = feed-forward
+# width) and pinned by the `dim` declarations below so the compiler can size
+# every buffer statically and reuse them (FR-3.1/3.2).
+# ---------------------------------------------------------------------------
+
+dim T = 4
+dim D = 16
+dim F = 32
+
+fn rms_norm(x: f32[T, D], w: f32[D]) -> f32[T, D] {
+    return rmsnorm(x, w)
+}
+
+fn attention(q: f32[T, D], k: f32[T, D], v: f32[T, D]) -> f32[T, D] {
+    # scores = q @ k^T  -> [T, T]; scale by 1/sqrt(D); row softmax; @ v
+    let kt = transpose(k)                 # [D, T]
+    let scores = matmul(q, kt)            # [T, T]  (float matmul)
+    let probs = softmax(scores * 0.25)    # 1/sqrt(D), D=16
+    return matmul(probs, v)               # [T, D]
+}
+
+fn mlp(x: f32[T, D], w1: trit[F, D], w2: trit[D, F]) -> f32[T, D] {
+    # SwiGLU-ish feed-forward with ternary weights.
+    let h = matmul_trit(x, w1)            # [T, F]  add/sub only
+    let a = silu(h)                       # fused activation
+    let out = matmul_trit(a, w2)          # [T, D]  add/sub only
+    return out
+}
+
+fn transformer_layer(x: f32[T, D],
+                     nw: f32[D],
+                     wq: trit[D, D], wk: trit[D, D], wv: trit[D, D], wo: trit[D, D],
+                     w1: trit[F, D], w2: trit[D, F]) -> f32[T, D] {
+    # Pre-norm attention residual branch.
+    let xn = rmsnorm(x, nw)               # [T, D]
+    let q = matmul_trit(xn, wq)           # [T, D]
+    let k = matmul_trit(xn, wk)           # [T, D]
+    let v = matmul_trit(xn, wv)           # [T, D]
+    let attn = attention(q, k, v)         # [T, D]
+    let proj = matmul_trit(attn, wo)      # [T, D]
+    let x1 = x + proj                     # residual add
+
+    # Pre-norm feed-forward residual branch.
+    let xn2 = rmsnorm(x1, nw)
+    let ffn = mlp(xn2, w1, w2)            # [T, D]
+    let x2 = x1 + ffn                     # residual add
+    return x2
+}

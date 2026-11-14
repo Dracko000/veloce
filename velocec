@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""velocec — the Veloce AOT compiler driver.
+
+Usage:
+    velocec build  input.vel [-o out.c] [--cc gcc] [--emit-exe driver.c]
+    velocec emit   input.vel [-o out.c]          # write C only
+    velocec ast    input.vel                     # dump AST (debug)
+    velocec check  input.vel                     # type-check only
+    velocec model-card model.veloce              # print embedded capability card
+    velocec version
+"""
+import os
+import sys
+import subprocess
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import veloce  # noqa: E402
+from veloce.errors import VeloceError  # noqa: E402
+
+RUNTIME_DIR = os.path.join(HERE, "runtime")
+
+
+def _fail(msg, code=1):
+    sys.stderr.write(f"velocec: error: {msg}\n")
+    sys.exit(code)
+
+
+def cmd_check(path):
+    try:
+        res = veloce.compile_file(path)
+    except VeloceError as e:
+        _fail(str(e))
+    print(res.report())
+    return res
+
+
+def cmd_erd(path, fmt):
+    import json
+    from veloce import erd
+    try:
+        res = veloce.compile_file(path)
+    except VeloceError as e:
+        _fail(str(e))
+    ent = erd.build_erd(res.module, res.memory, res.diagnostics)
+    if fmt == "mermaid":
+        print(erd.to_mermaid(ent))
+    else:
+        print(json.dumps(ent, indent=2))
+    return ent
+
+
+def cmd_emit(path, out):
+    try:
+        res = veloce.compile_file(path)
+    except VeloceError as e:
+        _fail(str(e))
+    out = out or (os.path.splitext(os.path.basename(path))[0] + ".c")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(res.c_source)
+    print(res.report())
+    print(f"wrote {out}")
+    return res, out
+
+
+def _supports_openmp(cc):
+    """True if `cc` accepts -fopenmp (FR-4.2 parallel kernels)."""
+    with tempfile.TemporaryDirectory() as td:
+        r = subprocess.run([cc, "-fopenmp", "-x", "c", "-", "-o",
+                            os.path.join(td, "probe")],
+                           input="int main(void){return 0;}\n",
+                           capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def cmd_model_card(path):
+    """Print the capability model card embedded in a .veloce file."""
+    from veloce import weights, capabilities
+    try:
+        vf = weights.VeloceFile(path)
+    except (OSError, ValueError) as e:
+        _fail(str(e))
+    try:
+        card = vf.model_card
+    finally:
+        vf.close()
+    if card is None:
+        _fail(f"{path}: no model_card in manifest "
+              "(written by an older Veloce version)")
+    try:
+        capabilities.validate_model_card(card)
+    except ValueError as e:
+        _fail(f"{path}: invalid model card: {e}")
+    print(capabilities.capability_summary(card))
+
+
+def cmd_build(path, out_c, cc, emit_exe):
+    res, cpath = cmd_emit(path, out_c)
+    obj = os.path.splitext(cpath)[0] + ".o"
+    inc = ["-I", RUNTIME_DIR]
+    flags = ["-std=c11", "-O3", "-march=native", "-ffast-math", "-pthread"]
+    # FR-4.2: the runtime parallelises kernels with OpenMP when available and
+    # transparently falls back to C11 <threads.h> (or serial) otherwise.
+    if _supports_openmp(cc):
+        flags.append("-fopenmp")
+        print("note: OpenMP enabled (parallel kernels); override with VELOCE_POOL=0")
+    else:
+        print("note: no OpenMP support; C11 threads fallback for parallel kernels")
+    # Compile the generated C to an object (no external runtime deps).
+    cc_argv = [cc, *flags, "-Wall", "-Wextra", "-Wno-unused-parameter", *inc,
+               "-c", cpath, "-o", obj]
+    print("cc:", " ".join(cc_argv))
+    r = subprocess.run(cc_argv)
+    if r.returncode != 0:
+        _fail("C compilation failed")
+    print(f"built {obj}")
+    if emit_exe:
+        exe = os.path.splitext(cpath)[0]
+        link_argv = [cc, *flags, *inc, emit_exe, obj, "-lm", "-o", exe]
+        print("cc:", " ".join(link_argv))
+        r = subprocess.run(link_argv)
+        if r.returncode != 0:
+            _fail("linking failed")
+        print(f"built executable {exe}")
+    return res
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        sys.exit(0)
+    cmd = argv[1]
+    if cmd == "version":
+        print(f"velocec {veloce.__version__}")
+        return
+    if cmd == "erd":
+        if len(argv) < 3:
+            _fail("'erd' requires an input file")
+        fmt = "json"
+        if "--format" in argv:
+            i = argv.index("--format")
+            if i + 1 < len(argv):
+                fmt = argv[i + 1]
+        cmd_erd(argv[2], fmt)
+        return
+    if cmd == "model-card":
+        if len(argv) < 3:
+            _fail("'model-card' requires a .veloce file")
+        cmd_model_card(argv[2])
+        return
+    if cmd in ("check", "emit", "build", "ast"):
+        if len(argv) < 3:
+            _fail(f"'{cmd}' requires an input file")
+        path = argv[2]
+        out = None
+        cc = os.environ.get("CC", "cc")
+        emit_exe = None
+        i = 3
+        while i < len(argv):
+            if argv[i] in ("-o", "--out") and i + 1 < len(argv):
+                out = argv[i + 1]; i += 2
+            elif argv[i] == "--cc" and i + 1 < len(argv):
+                cc = argv[i + 1]; i += 2
+            elif argv[i] == "--emit-exe" and i + 1 < len(argv):
+                emit_exe = argv[i + 1]; i += 2
+            else:
+                _fail(f"unknown option {argv[i]!r}")
+        if cmd == "check":
+            cmd_check(path)
+        elif cmd == "emit":
+            cmd_emit(path, out)
+        elif cmd == "build":
+            cmd_build(path, out, cc, emit_exe)
+        elif cmd == "ast":
+            from veloce import tokenize, parse
+            mod = parse(tokenize(open(path).read()))
+            print(mod)
+        return
+    _fail(f"unknown command {cmd!r}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)
