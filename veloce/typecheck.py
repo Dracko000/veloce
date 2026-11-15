@@ -206,12 +206,42 @@ class Checker:
                 if not isinstance(base_t, ast.TensorType):
                     raise TypeError_("indexed assignment requires a tensor/vector",
                                      tgt.line, tgt.col)
-                self.check_expr(tgt.index)
+                idx_t = self.check_expr(tgt.index)
                 base_sym = tgt.base.symbol if isinstance(tgt.base, ast.Var) else None
                 if base_sym and not base_sym.mut:
                     raise SemanticError(
                         f"cannot write into immutable '{tgt.base.name}'", tgt.line, tgt.col)
-                tgt.ctype = base_t.dtype
+                # `m[i, j]` writes one element; `m[i]` on a 2-D tensor writes a
+                # whole row, so the value being assigned must be a matching
+                # 1-D tensor, not a scalar.  Without this the two forms were
+                # indistinguishable to codegen, which emitted an element store
+                # for a row assignment and cast the RHS pointer to float.
+                if isinstance(tgt.index, ast.TupleExpr):
+                    if base_t.rank != 2:
+                        raise TypeError_("two-index assignment requires a 2-D tensor",
+                                         tgt.line, tgt.col)
+                    tgt.ctype = base_t.dtype
+                elif base_t.rank == 2:
+                    row_t = ast.TensorType(base_t.dtype, base_t.dims[1:])
+                    # `[1, D]` is the shape every matmul in this language
+                    # returns, so writing one into a cache row must work --
+                    # otherwise a KV-cache append needs a pointless reshape.
+                    squeezed = (isinstance(vt, ast.TensorType) and vt.rank == 2
+                                and vt.dims[0].value == 1
+                                and self.types_equal(
+                                    ast.TensorType(vt.dtype, vt.dims[1:]), row_t))
+                    if not (self.types_equal(row_t, vt) or squeezed):
+                        raise TypeError_(
+                            f"row assignment to '{getattr(tgt.base, 'name', '?')}' "
+                            f"needs a {row_t} value, got {vt}", stmt.line, stmt.col)
+                    tgt.ctype = row_t
+                else:
+                    if isinstance(vt, ast.TensorType):
+                        raise TypeError_(
+                            f"cannot assign a tensor into one element of "
+                            f"'{getattr(tgt.base, 'name', '?')}'", stmt.line, stmt.col)
+                    tgt.ctype = base_t.dtype
+                tgt.row_store = base_t.rank == 2 and not isinstance(tgt.index, ast.TupleExpr)
             else:
                 raise SemanticError("invalid assignment target", stmt.line, stmt.col)
 
@@ -474,6 +504,73 @@ class Checker:
         return ast.TensorType(ast.ScalarType(FLOAT_PRIM),
                               (lt.dims[0], rt.dims[0]))
 
+    def _lowbit_matmul(self, e, fname, dtype, label):
+        """Shared shape check for a [N,K]-weight low-bit matmul.
+
+        x: f32[M,K], w: <dtype>[N,K] -> f32[M,N].  Weights are stored
+        [out, in] like every other Veloce weight tensor.
+        """
+        lt = self._tensor_arg(e, 0, fname, e)
+        rt = self._tensor_arg(e, 1, fname, e)
+        if rt.dtype.name != dtype:
+            raise TypeError_(f"{fname} requires a {dtype} ({label}) weight tensor",
+                             e.line, e.col)
+        if lt.rank != 2 or rt.rank != 2:
+            raise TypeError_(f"{fname} requires 2-D tensors", e.line, e.col)
+        n, k = lt.dims[1], rt.dims[1]
+        if not (n.is_symbol or k.is_symbol or n.value == k.value):
+            raise TypeError_(
+                f"{fname} inner dimension mismatch: x{list(lt.dims)} vs "
+                f"w{list(rt.dims)} (weights must be [out, in])", e.line, e.col)
+        e.lower = fname
+        key = f"{dtype}_matmul"
+        self.diag[key] = self.diag.get(key, 0) + 1
+        return ast.TensorType(ast.ScalarType(FLOAT_PRIM), (lt.dims[0], rt.dims[0]))
+
+    def bi_matmul_i2(self, e):
+        """matmul_i2(x: f32[M,K], w: i2[N,K]) -> f32[M,N].
+
+        Packed 2-bit weights: four signed values per byte, values in [-2, 1].
+        """
+        return self._lowbit_matmul(e, "matmul_i2", "i2", "2-bit")
+
+    def bi_matmul_fp8(self, e):
+        """matmul_fp8(x: f32[M,K], w: fp8[N,K]) -> f32[M,N].
+
+        E4M3 weights, one byte per value, decoded to f32 during the dot.
+        """
+        return self._lowbit_matmul(e, "matmul_fp8", "fp8", "E4M3")
+
+    def _lowbit_matmul_scaled(self, e, fname, dtype, label):
+        """[N,K] low-bit weights plus one f32 scale per output row."""
+        lt = self._tensor_arg(e, 0, fname, e)
+        wt = self._tensor_arg(e, 1, fname, e)
+        st = self._tensor_arg(e, 2, fname, e)
+        if wt.dtype.name != dtype:
+            raise TypeError_(f"{fname} requires a {dtype} ({label}) weight tensor",
+                             e.line, e.col)
+        if st.dtype.name != "f32" or st.rank != 1:
+            raise TypeError_(f"{fname} scales must be f32[N]", e.line, e.col)
+        if lt.rank != 2 or wt.rank != 2:
+            raise TypeError_(f"{fname} requires 2-D tensors", e.line, e.col)
+        if not (lt.dims[1].is_symbol or wt.dims[1].is_symbol
+                or lt.dims[1].value == wt.dims[1].value):
+            raise TypeError_(f"{fname} inner dimension mismatch", e.line, e.col)
+        if not (wt.dims[0].is_symbol or st.dims[0].is_symbol
+                or wt.dims[0].value == st.dims[0].value):
+            raise TypeError_(f"{fname} scales must have one entry per output feature",
+                             e.line, e.col)
+        e.lower = fname
+        key = f"{dtype}_matmul"
+        self.diag[key] = self.diag.get(key, 0) + 1
+        return ast.TensorType(ast.ScalarType(FLOAT_PRIM), (lt.dims[0], wt.dims[0]))
+
+    def bi_matmul_i2_s(self, e):
+        return self._lowbit_matmul_scaled(e, "matmul_i2_s", "i2", "2-bit")
+
+    def bi_matmul_fp8_s(self, e):
+        return self._lowbit_matmul_scaled(e, "matmul_fp8_s", "fp8", "E4M3")
+
     def bi_zeros_i32(self, e):
         dims = []
         for a in e.args:
@@ -506,6 +603,18 @@ class Checker:
         if not (wt.dims[0].is_symbol or st.dims[0].is_symbol
                 or wt.dims[0].value == st.dims[0].value):
             raise TypeError_("matmul_i4g scales rows must match output features", e.line, e.col)
+        # Group count must divide K exactly: the runtime is handed a group
+        # *size* and derives the count back as ceil(K / G), so a ragged shape
+        # (K=100 over 7 groups) would silently scale rows against the wrong
+        # slices.  Symbolic dims can't be checked here; they are resolved by
+        # the time codegen runs.
+        k, ng = wt.dims[1], st.dims[1]
+        if not (k.is_symbol or ng.is_symbol):
+            if ng.value <= 0 or k.value % ng.value != 0:
+                raise TypeError_(
+                    f"matmul_i4g: scales declare {ng.value} group(s) but the "
+                    f"inner dimension is K={k.value}; the group count must "
+                    f"divide K exactly", e.line, e.col)
         e.lower = "matmul_i4g"
         self.diag["i4_matmul"] = self.diag.get("i4_matmul", 0) + 1
         return ast.TensorType(ast.ScalarType(FLOAT_PRIM), (lt.dims[0], wt.dims[0]))

@@ -30,7 +30,8 @@ DTYPE_CTYPE = {
     "i64": "int64_t",
     "i8": "int8_t",
     "u8": "uint8_t",
-    "i2": "int8_t",    # declared storage type (not yet packed)
+    "i2": "uint8_t",   # PACKED signed 2-bit values, 4 per byte
+    "fp8": "uint8_t",  # E4M3, one byte per value
     "i4": "uint8_t",   # PACKED signed nibbles, 2 per byte
     "bool": "bool",
 }
@@ -218,6 +219,15 @@ class CodeGen:
     def gen_index_store(self, tgt, rhs):
         bt = getattr(tgt.base, "ctype", None)
         base_ptr = self.gen_expr(tgt.base)
+        # A row store (`cache[pos] = vector`) copies a whole row; an element
+        # store assigns one scalar.  These used to share one code path, which
+        # emitted `(float)(ptr)` for a row store -- a silent miscompile.
+        if getattr(tgt, "row_store", False):
+            rhs_ptr = self.gen_expr(rhs)
+            idx = self.gen_expr(tgt.index)
+            cols = bt.dims[1].value
+            self.emit(f"veloce_copyf({base_ptr} + ({idx}) * {cols}, {rhs_ptr}, {cols});")
+            return
         val = self.gen_expr(rhs)
         cast = "float"
         if getattr(bt, "dtype", None) is not None and bt.dtype.name in ("i32", "i64", "i8", "u8"):
@@ -439,8 +449,44 @@ class CodeGen:
             st = getattr(e.args[2], "ctype")
             M, K = lt.dims[0].value, lt.dims[1].value
             N = rt.dims[0].value
-            G = K // st.dims[1].value
+            # The caller declares scales as [N, n_groups] and the runtime takes
+            # the group SIZE, deriving n_groups back as ceil(K / G).  The two
+            # only agree when the group count divides K exactly, which
+            # typecheck enforces; with that guaranteed, K // n_groups is the
+            # exact group size.  (This used to be a bare floor division, which
+            # silently mismatched the runtime for ragged shapes such as K=100
+            # over 7 groups and scaled every row against the wrong slices.)
+            ngroups = st.dims[1].value
+            G = K // ngroups
             self.emit(f"veloce_matmul_i4g({d}, {x}, {w}, {sc}, {M}, {K}, {N}, {G});")
+        elif lower == "matmul_i2":
+            d = dest or self._dst(e)
+            x = self.tptr(e.args[0]); w = self.tptr(e.args[1])
+            lt = getattr(e.args[0], "ctype"); rt = getattr(e.args[1], "ctype")
+            M, K = lt.dims[0].value, lt.dims[1].value
+            N = rt.dims[0].value
+            self.emit(f"veloce_matmul_i2({d}, {x}, {w}, {M}, {K}, {N});")
+        elif lower == "matmul_i2_s":
+            d = dest or self._dst(e)
+            x = self.tptr(e.args[0]); w = self.tptr(e.args[1]); sc = self.tptr(e.args[2])
+            lt = getattr(e.args[0], "ctype"); rt = getattr(e.args[1], "ctype")
+            M, K = lt.dims[0].value, lt.dims[1].value
+            N = rt.dims[0].value
+            self.emit(f"veloce_matmul_i2_s({d}, {x}, {w}, {sc}, {M}, {K}, {N});")
+        elif lower == "matmul_fp8":
+            d = dest or self._dst(e)
+            x = self.tptr(e.args[0]); w = self.tptr(e.args[1])
+            lt = getattr(e.args[0], "ctype"); rt = getattr(e.args[1], "ctype")
+            M, K = lt.dims[0].value, lt.dims[1].value
+            N = rt.dims[0].value
+            self.emit(f"veloce_matmul_fp8({d}, {x}, {w}, {M}, {K}, {N});")
+        elif lower == "matmul_fp8_s":
+            d = dest or self._dst(e)
+            x = self.tptr(e.args[0]); w = self.tptr(e.args[1]); sc = self.tptr(e.args[2])
+            lt = getattr(e.args[0], "ctype"); rt = getattr(e.args[1], "ctype")
+            M, K = lt.dims[0].value, lt.dims[1].value
+            N = rt.dims[0].value
+            self.emit(f"veloce_matmul_fp8_s({d}, {x}, {w}, {sc}, {M}, {K}, {N});")
         elif lower == "matmul_trit_s":
             d = dest or self._dst(e)
             x = self.tptr(e.args[0]); w = self.tptr(e.args[1]); sc = self.tptr(e.args[2])

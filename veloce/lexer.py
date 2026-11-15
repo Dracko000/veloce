@@ -65,7 +65,8 @@ KEYWORDS = {
     "extern",
 }
 
-DTYPE_NAMES = {"trit", "fp16", "fp32", "f32", "i2", "i4", "i8", "i32", "i64", "u8", "bool"}
+DTYPE_NAMES = {"trit", "fp16", "fp32", "f32", "fp8", "i2", "i4", "i8", "i32",
+               "i64", "u8", "bool"}
 
 
 class Token:

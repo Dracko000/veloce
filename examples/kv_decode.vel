@@ -1,0 +1,48 @@
+module kv_decode
+
+# ---------------------------------------------------------------------------
+# Autoregressive decoding with a caller-owned KV cache.
+#
+# v1.0 could only do T=1 with no cache, so every generated token recomputed
+# the whole prefix.  The missing piece was never the arithmetic -- it was that
+# `cache[pos] = row` (a whole-row store into a tensor the caller owns) was
+# miscompiled into a scalar store of a cast pointer, and `rw` parameters were
+# parsed but not otherwise honoured.
+#
+# With row stores working, a cache is just a `rw` parameter: the host allocates
+# f32[CT, D] once, zeroes it, and calls decode_step() once per token with the
+# slot to fill.  Nothing is allocated at runtime (the arena is static and the
+# cache is caller memory), and results stay bit-identical across thread counts
+# because every kernel still accumulates each output element in fixed order.
+#
+#   cache_k, cache_v : rw f32[CT, D]   key/value rows, one per position
+#   x                : f32[1, D]       this token's hidden state
+#   nw               : f32[D]          rmsnorm gain
+#   wk, wv           : trit[D, D]      projections
+#   pos              : i32             slot this token is written to
+#
+# See examples/run_kv_decode.py for the host loop and the NumPy reference.
+# ---------------------------------------------------------------------------
+
+dim CT = 8
+dim D = 16
+
+fn decode_step(rw cache_k: f32[CT, D], rw cache_v: f32[CT, D],
+               x: f32[1, D], nw: f32[D],
+               wk: trit[D, D], wv: trit[D, D],
+               pos: i32) -> f32[1, D] {
+    let xn = rmsnorm(x, nw)              # [1, D]
+    let k = matmul_trit(xn, wk)          # [1, D]  add/sub only
+    let v = matmul_trit(xn, wv)          # [1, D]
+    cache_k[pos] = k                     # row store into the caller's buffer
+    cache_v[pos] = v
+    return v
+}
+
+# Attention over every slot of the cache: attn = softmax(q @ K^T) @ V.
+fn attend(cache_k: f32[CT, D], cache_v: f32[CT, D], q: f32[1, D]) -> f32[1, D] {
+    let kt = transpose(cache_k)          # [D, CT]
+    let scores = matmul(q, kt)           # [1, CT]
+    let probs = softmax(scores)          # [1, CT]
+    return matmul(probs, cache_v)        # [1, D]
+}

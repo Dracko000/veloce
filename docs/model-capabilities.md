@@ -72,7 +72,8 @@ agentic model — or route it to an evaluation queue first.
 |-------|--------------------|------------------------|
 | Packed low-bit weights, trit/i4 kernels | ✅ | |
 | Zero-copy `.veloce` mmap, static arena | ✅ | |
-| Prefix caching / KV cache | ❌ (v1.0 is T=1, no KV cache) | |
+| Caller-owned KV cache (`rw` tensors, row stores) | ✅ (`examples/run_kv_decode.py`) | |
+| Attention masking over unwritten cache slots | ❌ (softmax has no mask yet) | |
 | Tool-call markers, chat template | ❌ (runtime-agnostic; host handles) | |
 | Specialist knowledge, world grounding | | ✅ data + scale |
 | Planning, tool use, multi-step agency | | ✅ post-training + RL |

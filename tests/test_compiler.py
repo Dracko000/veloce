@@ -193,6 +193,115 @@ fn f(x: f32[M, K], w: i4[N, K]) -> f32[M, N] {
         c = veloce.compile_source(src, module_name="t").c_source
         self.assertIn("veloce_matmul_i4", c)
 
+    def test_i4g_group_size_matches_scales(self):
+        """matmul_i4g must hand the runtime the group size implied by the
+        declared scale shape, not a floor division that disagrees with it."""
+        src = """module t
+dim M = 2
+dim K = 64
+dim N = 8
+dim NG = 16
+fn f(x: f32[M, K], w: i4[N, K], s: f32[N, NG]) -> f32[M, N] {
+    return matmul_i4g(x, w, s)
+}
+"""
+        c = veloce.compile_source(src, module_name="t").c_source
+        self.assertIn("veloce_matmul_i4g(", c)
+        self.assertIn(", 64, 8, 4);", c)   # K=64, N=8, group size 64/16=4
+
+    def test_i4g_rejects_ragged_group_count(self):
+        """A group count that does not divide K has no single group size, so it
+        must be rejected instead of silently scaling the wrong slices."""
+        src = """module t
+dim M = 2
+dim K = 100
+dim N = 5
+dim NG = 7
+fn f(x: f32[M, K], w: i4[N, K], s: f32[N, NG]) -> f32[M, N] {
+    return matmul_i4g(x, w, s)
+}
+"""
+        with self.assertRaises(TypeError_):
+            veloce.compile_source(src, module_name="t")
+
+    def test_trit_s_codegen(self):
+        src = """module t
+dim M = 2
+dim K = 64
+dim N = 8
+fn f(x: f32[M, K], w: trit[N, K], s: f32[N]) -> f32[M, N] {
+    return matmul_trit_s(x, w, s)
+}
+"""
+        c = veloce.compile_source(src, module_name="t").c_source
+        self.assertIn("veloce_matmul_trit_s(", c)
+
+    def test_i2_and_fp8_roundtrip(self):
+        """The .veloce container carries the new dtypes zero-copy."""
+        import numpy as np
+        w2 = np.array([[-2, 1, 0, -1], [1, 1, -2, 0]], dtype=np.int8)
+        wf = np.array([[1.0, -1.5, 0.25, 448.0]], dtype=np.float32)
+        man = weights.write_veloce_model(
+            "/tmp/t_i2fp8.veloce",
+            [{"name": "a", "dtype": "i2", "data": w2},
+             {"name": "b", "dtype": "fp8", "data": wf}])
+        # 4 i2 values per byte, 1 byte per fp8 value
+        self.assertEqual(man["tensors"][0]["nbytes"], 2)
+        self.assertEqual(man["tensors"][1]["nbytes"], 4)
+        f = weights.VeloceFile("/tmp/t_i2fp8.veloce")
+        try:
+            self.assertEqual(f.numpy("a").tolist(), w2.tolist())
+            self.assertEqual(f.numpy("b").tolist(), wf.tolist())
+            self.assertEqual(len(f.raw("a")), 2)   # zero-copy view
+        finally:
+            f.close()
+
+    def test_i2_codegen(self):
+        src = """module t
+dim M = 2
+dim K = 64
+dim N = 8
+fn f(x: f32[M, K], w: i2[N, K]) -> f32[M, N] {
+    return matmul_i2(x, w)
+}
+fn g(x: f32[M, K], w: i2[N, K], s: f32[N]) -> f32[M, N] {
+    return matmul_i2_s(x, w, s)
+}
+"""
+        c = veloce.compile_source(src, module_name="t").c_source
+        self.assertIn("veloce_matmul_i2(", c)
+        self.assertIn("veloce_matmul_i2_s(", c)
+
+    def test_fp8_codegen(self):
+        src = """module t
+dim M = 2
+dim K = 64
+dim N = 8
+fn f(x: f32[M, K], w: fp8[N, K]) -> f32[M, N] {
+    return matmul_fp8(x, w)
+}
+fn g(x: f32[M, K], w: fp8[N, K], s: f32[N]) -> f32[M, N] {
+    return matmul_fp8_s(x, w, s)
+}
+"""
+        c = veloce.compile_source(src, module_name="t").c_source
+        self.assertIn("veloce_matmul_fp8(", c)
+        self.assertIn("veloce_matmul_fp8_s(", c)
+
+    def test_lowbit_matmul_rejects_wrong_dtype(self):
+        """Each low-bit matmul demands its own storage dtype."""
+        for fn, dt, wrong in (("matmul_i2", "i2", "i4"), ("matmul_fp8", "fp8", "i2")):
+            src = f"""module t
+dim M = 2
+dim K = 64
+dim N = 8
+fn f(x: f32[M, K], w: {wrong}[N, K]) -> f32[M, N] {{
+    return {fn}(x, w)
+}}
+"""
+            with self.assertRaises(TypeError_):
+                veloce.compile_source(src, module_name="t")
+
     def test_trit_size(self):
         vals = [1] * 1000
         packed = weights.pack_trits(vals)

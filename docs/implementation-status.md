@@ -9,8 +9,8 @@ plainly.
 
 | ID | Requirement | Implementation | Where |
 |----|-------------|----------------|-------|
-| FR-1.1 | First-class sub-byte primitives (`trit`, `i2`, `i4`, `fp8`, `fp16`) | `trit` (5/byte), `i4` (2/byte) and `fp16` fully lowered to packed kernels; `i2`/`fp8` are recognised dtype names only | `lexer.py`, `ast.py`, `typecheck.py`, `weights.py`, `runtime/veloce_runtime.h` |
-| FR-1.2 | Automatic bit-packing (5 trits → 1 byte) | Base-3 flat packing, shared by compiler (`pack_trits`), C runtime (`veloce_pack_trits`), and `.veloce` files; `i4` packs two signed nibbles per byte the same way | `weights.py`, `runtime/veloce_runtime.h` |
+| FR-1.1 | First-class sub-byte primitives (`trit`, `i2`, `i4`, `fp8`, `fp16`) | All five are packed storage types with their own kernels: `trit` (5/byte, add/sub lowering), `i4` (2 signed nibbles/byte), `i2` (4 signed values/byte, values in [-2,1]), `fp8` (E4M3, 1 byte/value, decoded to f32 during the dot) and `fp16`. Each has a plain and a row-scaled (`_s`) matmul, plus a group-scaled variant for `i4`/`trit` | `lexer.py`, `ast.py`, `typecheck.py`, `codegen.py`, `weights.py`, `runtime/veloce_runtime.h` |
+| FR-1.2 | Automatic bit-packing (5 trits → 1 byte) | Base-3 flat packing, shared by compiler (`pack_trits`), C runtime (`veloce_pack_trits`), and `.veloce` files; `i4` packs two signed nibbles per byte, `i2` four signed 2-bit values per byte, and `fp8` one E4M3 byte per value, all with the same on-disk-equals-in-memory contract | `weights.py`, `runtime/veloce_runtime.h` |
 | FR-1.3 | MatMul-free lowering of trit matmuls to ADD/SUB | `matmul_trit` → `veloce_matmul_trit` (sign in {-1,0,1}: `acc += x[k]` / `acc -= x[k]`, no FP multiply) | `codegen.py`, `runtime/veloce_runtime.h` |
 | FR-2.1 | Loop-free declarative tensor algebra, einsum/matmul/`+ * @` | No `for` statement exists; `matmul`, `@`, elementwise ops, `transpose`, `softmax`, etc. | `parser.py`, `typecheck.py` |
 | FR-2.2 | Automatic operator fusion of elementwise/reduction chains | Pure elementwise chains collapse to a single register loop `for i: d[i] = <expr(i)>` with no intermediate buffers | `codegen.py` (`_is_pure_ew`, `_build_ew`) |
@@ -52,12 +52,30 @@ real module (see `test_erd_introspection`).
   during the kernel; activations are `f32`. Arithmetic in `f32` is not an
   "approximation" of the PRD — it is the standard low-bit inference design
   (quantize storage, accumulate in float).
-* **`i2`/`fp8`** are recognised dtype names but have no dedicated packed
-  kernel yet. `i4` *is* implemented end to end: `pack_i4`/`veloce_pack_i4`
+* **Every PRD dtype is implemented end to end.** `i4`: `pack_i4`/`veloce_pack_i4`
   store two signed nibbles per byte (low nibble = element 2k, high = 2k+1),
-  `veloce_matmul_i4` lowers through a 256×4 signed-nibble LUT, and
-  `test_i4_matmul_bit_exact` checks it is bit-identical across 1/2/4 threads
-  and across the `.veloce` roundtrip.
+  `veloce_matmul_i4` lowers through a 256×4 signed-nibble LUT.
+  `i2`: `pack_i2` stores four signed 2-bit values per byte (values in [-2,1]),
+  `veloce_matmul_i2` decodes through a 256×4 LUT with an AVX2 path.
+  `fp8`: `pack_fp8` stores one E4M3 byte per value (bias 7, max 448); the
+  runtime decodes with a lazily built 256-entry table, so an E4M3 checkpoint
+  maps zero-copy and is expanded during the dot product.
+  `test_i4_matmul_bit_exact`, `test_i2_matmul_numeric` and
+  `test_fp8_matmul_numeric` check each one is bit-identical across 1/2/4
+  threads and across the `.veloce` roundtrip. Measured max |err| vs a float64
+  reference: 5.6e-6 (i2, K=1003) and 4.3e-6 (fp8, K=517).
+* **Group- and row-scaled variants** exist for the integer dtypes
+  (`matmul_i4g` takes `f32[N, groups]`, `matmul_trit_s`/`matmul_i2_s`/
+  `matmul_fp8_s` take `f32[N]`). The group count must divide the inner
+  dimension exactly — a ragged count has no single group size, so it is
+  rejected at compile time rather than silently scaling the wrong slices.
+* **KV cache (FR-2.1 scope)**: a tensor parameter declared `rw` is a
+  caller-owned mutable buffer, and `cache[pos] = row` stores a whole row into
+  it, so a host loop can keep keys/values across calls. `examples/kv_decode.vel`
+  plus `examples/run_kv_decode.py` decode five tokens this way (max |err|
+  7.7e-7 per token, 1.0e-6 for the cached attention). Attention masking is not
+  implemented yet, so a cache attends over every slot; the shipped example
+  zeroes the cache first and compares against a matching reference.
 * **FR-4.2 threading policy**: work is split over *independent output*
   elements only (rows for matmul/rmsnorm/softmax, elements for elementwise
   ops), never over a reduction axis, which is why bit-exact determinism is
@@ -104,8 +122,9 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 20 end-to-end tests (`test_veloce.py`, incl. 3 FR-4.2 thread-consistency tests and an `-ffast-math` SiLU saturation regression) + 23 front-end/codegen/packing tests (`test_compiler.py`) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 28 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel and an `-ffast-math` SiLU saturation regression) + 32 front-end/codegen/packing tests (`test_compiler.py`) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
+| `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |
 | `make demo` | tiny-LM inference demo: ternary weights are 89.9% smaller than fp16 (PRD ≥80% target) |
 | `make bench-throughput` | real measured throughput vs the PRD targets: trit GEMV GMAC/s, attention GFLOP/s, projected 7B-class tokens/s, memory-bandwidth roofline, footprint and compile-time checks |

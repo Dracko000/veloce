@@ -1145,6 +1145,310 @@ static inline void veloce_matmul_trit_s(float *out, const float *x, const uint8_
     else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_trits_mat_row, &c);
 }
 
+/* ------------------------------------------------------------------ */
+/* Packed i2 weights (FR-1.1): 4 signed 2-bit values per byte.         */
+/*   slot k (low -> high) = element 4b + k                             */
+/*   value = sign-extended 2-bit int in [-2, 1]                        */
+/* The narrowest PRD dtype: 4 values/byte, so a 7B model's weights     */
+/* cost 1.75 GB against 1.32 GB for trit and 13.2 GB for fp16.         */
+/* ------------------------------------------------------------------ */
+static inline size_t veloce_i2_rowbytes(size_t k) { return (k + 3) / 4; }
+
+static inline uint8_t veloce_pack_i2(const int8_t *vals, size_t n) {
+    (void)n;
+    uint8_t b = 0;
+    for (int s = 0; s < 4; s++) b |= (uint8_t)((vals[s] & 0x03) << (2 * s));
+    return b;
+}
+
+/* 256-entry float decode table: one packed byte -> four floats.
+ * Padded to 8 floats / 32 bytes so an AVX2 FMA can consume a byte per load. */
+#define VELOCE_I2_F(b) \
+    { (float)(((b) & 0x03) < 2 ? ((b) & 0x03) : ((b) & 0x03) - 4), \
+      (float)((((b) >> 2) & 0x03) < 2 ? (((b) >> 2) & 0x03) : (((b) >> 2) & 0x03) - 4), \
+      (float)((((b) >> 4) & 0x03) < 2 ? (((b) >> 4) & 0x03) : (((b) >> 4) & 0x03) - 4), \
+      (float)((((b) >> 6) & 0x03) < 2 ? (((b) >> 6) & 0x03) : (((b) >> 6) & 0x03) - 4), \
+      0.0f, 0.0f, 0.0f, 0.0f }
+#define VELOCE_I2_F16(b) \
+    VELOCE_I2_F(b), VELOCE_I2_F(b+1), VELOCE_I2_F(b+2), VELOCE_I2_F(b+3), \
+    VELOCE_I2_F(b+4), VELOCE_I2_F(b+5), VELOCE_I2_F(b+6), VELOCE_I2_F(b+7), \
+    VELOCE_I2_F(b+8), VELOCE_I2_F(b+9), VELOCE_I2_F(b+10), VELOCE_I2_F(b+11), \
+    VELOCE_I2_F(b+12), VELOCE_I2_F(b+13), VELOCE_I2_F(b+14), VELOCE_I2_F(b+15)
+#define VELOCE_I2_F64(b) \
+    VELOCE_I2_F16(b), VELOCE_I2_F16(b+16), VELOCE_I2_F16(b+32), VELOCE_I2_F16(b+48)
+static const float VELOCE_I2_LUT[256][8] __attribute__((aligned(32))) = {
+    VELOCE_I2_F64(0), VELOCE_I2_F64(64), VELOCE_I2_F64(128), VELOCE_I2_F64(192)
+};
+
+/* Portable i2 dot: four signed 2-bit values per byte. */
+static inline float veloce_i2_dot_lut(const float *x, const uint8_t *w,
+                                      size_t base, size_t K) {
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    size_t q = 0, e = base;
+    size_t skip = e % 4;
+    if (skip) {
+        const float *v = VELOCE_I2_LUT[w[e / 4]];
+        size_t n = 4 - skip; if (n > K) n = K;
+        for (size_t s = 0; s < n; s++) a0 += x[q++] * v[skip + s];
+        e += n;
+    }
+    size_t full = (K - q) / 4;
+    for (size_t b = 0; b < full; b++, q += 4, e += 4) {
+        const float *v = VELOCE_I2_LUT[w[e / 4]];
+        const float *xp = x + q;
+        a0 += xp[0] * v[0]; a1 += xp[1] * v[1];
+        a2 += xp[2] * v[2]; a3 += xp[3] * v[3];
+    }
+    float acc = (a0 + a1) + (a2 + a3);
+    for (; q < K; q++, e++) {
+        const float *v = VELOCE_I2_LUT[w[e / 4]];
+        acc += x[q] * v[e % 4];
+    }
+    return acc;
+}
+
+#if defined(__AVX2__) && !defined(VELOCE_NO_AVX2)
+/* AVX2 i2 dot: four packed bytes (16 values) per iteration. */
+static inline float veloce_i2_dot_avx2(const float *x, const uint8_t *w,
+                                       size_t base, size_t K) {
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    float tail = 0.0f;
+    size_t q = 0, e = base;
+    size_t skip = e % 4;
+    if (skip) {
+        const float *v = VELOCE_I2_LUT[w[e / 4]];
+        size_t n = 4 - skip; if (n > K) n = K;
+        for (size_t s = 0; s < n; s++) tail += x[q++] * v[skip + s];
+        e += n;
+    }
+    size_t full = (K - q) / 4;
+    size_t bi = e / 4, b = 0;
+    for (; b + 4 <= full; b += 4, bi += 4, q += 16, e += 16) {
+        const float *v0 = VELOCE_I2_LUT[w[bi]];
+        const float *v1 = VELOCE_I2_LUT[w[bi + 1]];
+        const float *v2 = VELOCE_I2_LUT[w[bi + 2]];
+        const float *v3 = VELOCE_I2_LUT[w[bi + 3]];
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + q),     _mm256_load_ps(v0), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + q + 4), _mm256_load_ps(v1), acc1);
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + q + 8), _mm256_load_ps(v2), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + q + 12), _mm256_load_ps(v3), acc1);
+    }
+    for (; b < full; b++, bi++, q += 4, e += 4) {
+        const float *v = VELOCE_I2_LUT[w[bi]];
+        tail += x[q] * v[0] + x[q + 1] * v[1] + x[q + 2] * v[2] + x[q + 3] * v[3];
+    }
+    __m256 s = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(s);
+    __m128 hi = _mm256_extractf128_ps(s, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    s4 = _mm_hadd_ps(s4, s4); s4 = _mm_hadd_ps(s4, s4);
+    float acc = tail + _mm_cvtss_f32(s4);
+    for (; q < K; q++, e++) {
+        const float *v = VELOCE_I2_LUT[w[e / 4]];
+        acc += x[q] * v[e % 4];
+    }
+    return acc;
+}
+#endif
+
+static inline float veloce_i2_dot(const float *x, const uint8_t *w,
+                                  size_t base, size_t K) {
+#if defined(__AVX2__) && !defined(VELOCE_NO_AVX2)
+    return veloce_i2_dot_avx2(x, w, base, K);
+#else
+    return veloce_i2_dot_lut(x, w, base, K);
+#endif
+}
+
+typedef struct { float *out; const float *x; const uint8_t *w; size_t M, K, N; } veloce_mm_i2_ctx;
+static inline void veloce_mm_i2_gemv_row(void *vctx, size_t j) {
+    const veloce_mm_i2_ctx *c = (const veloce_mm_i2_ctx *)vctx;
+    c->out[j] = veloce_i2_dot(c->x, c->w, j * c->K, c->K);
+}
+static inline void veloce_mm_i2_mat_row(void *vctx, size_t i) {
+    const veloce_mm_i2_ctx *c = (const veloce_mm_i2_ctx *)vctx;
+    const float *xr = c->x + i * c->K;
+    for (size_t j = 0; j < c->N; j++)
+        c->out[i * c->N + j] = veloce_i2_dot(xr, c->w, j * c->K, c->K);
+}
+/* x: [M,K] f32, w: [N,K] packed i2 (4/byte, FLAT), out: [M,N] f32. */
+static inline void veloce_matmul_i2(float *out, const float *x, const uint8_t *w,
+                                    size_t M, size_t K, size_t N) {
+    veloce_mm_i2_ctx c = { out, x, w, M, K, N };
+    const size_t row_bytes = veloce_i2_rowbytes(K);
+    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_i2_gemv_row, &c);
+    else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_i2_mat_row, &c);
+}
+
+/* Row-scaled i2 matmul: w [N,K] packed i2, scales [N] f32. */
+typedef struct { float *out; const float *x; const uint8_t *w; const float *s;
+                 size_t M, K, N; } veloce_mm_i2s_ctx;
+static inline void veloce_mm_i2s_gemv_row(void *vctx, size_t j) {
+    const veloce_mm_i2s_ctx *c = (const veloce_mm_i2s_ctx *)vctx;
+    c->out[j] = c->s[j] * veloce_i2_dot(c->x, c->w, j * c->K, c->K);
+}
+static inline void veloce_mm_i2s_mat_row(void *vctx, size_t i) {
+    const veloce_mm_i2s_ctx *c = (const veloce_mm_i2s_ctx *)vctx;
+    const float *xr = c->x + i * c->K;
+    for (size_t j = 0; j < c->N; j++)
+        c->out[i * c->N + j] = c->s[j] * veloce_i2_dot(xr, c->w, j * c->K, c->K);
+}
+static inline void veloce_matmul_i2_s(float *out, const float *x, const uint8_t *w,
+                                      const float *scales, size_t M, size_t K, size_t N) {
+    veloce_mm_i2s_ctx c = { out, x, w, scales, M, K, N };
+    const size_t row_bytes = veloce_i2_rowbytes(K) + sizeof(float);
+    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_i2s_gemv_row, &c);
+    else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_i2s_mat_row, &c);
+}
+
+/* ------------------------------------------------------------------ */
+/* fp8 weights (FR-1.1): E4M3 (bias 7), one byte per value.            */
+/*   sign | 4-bit exponent | 3-bit mantissa                            */
+/*   finite range +/-448, smallest normal 2^-6, subnormals 2^-9 * m    */
+/*   E4M3 has no infinity; 0x7F/0xFF are NaN, which decode to 0 so a   */
+/*   corrupt byte cannot poison an entire activation row.              */
+/* Decoded to f32 on the fly, exactly like fp16 storage: the packed    */
+/* layout is the on-disk layout, so an E4M3 checkpoint maps zero-copy. */
+/* ------------------------------------------------------------------ */
+static inline float veloce_e4m3_to_float(uint8_t b) {
+    const unsigned sign = (unsigned)(b >> 7);
+    const unsigned exp = (unsigned)((b >> 3) & 0x0F);
+    const unsigned man = (unsigned)(b & 0x07);
+    float v;
+    if (exp == 0) {
+        /* subnormal: 2^-6 * (man/8) */
+        v = (float)man * (1.0f / 8.0f) * (1.0f / 64.0f);
+    } else if (exp == 15 && man == 7) {
+        v = 0.0f;                      /* NaN in E4M3 (both signs) */
+    } else {
+        /* normal: 2^(exp-7) * (1 + man/8); exp==15 & man<7 is finite */
+        float p = 1.0f;
+        int e = (int)exp - 7;
+        /* avoid ldexpf (libm dependency in the hot loop) */
+        p = (e >= 0) ? (float)(1 << e) : (1.0f / (float)(1 << (-e)));
+        v = p * (1.0f + (float)man * (1.0f / 8.0f));
+    }
+    return sign ? -v : v;
+}
+
+/* 256-entry fp8 decode table, padded to 8 floats like the other LUTs.
+ * It is filled once on first use: `veloce_e4m3_to_float` is not a constant
+ * expression, so a static initialiser cannot be used (and the table must
+ * stay in BSS anyway to keep the "zero runtime allocation" rule -- it is a
+ * fixed-size static, not heap). */
+static float VELOCE_FP8_LUT[256][8] __attribute__((aligned(32)));
+static int VELOCE_FP8_LUT_READY = 0;
+static inline const float *veloce_fp8_lut_init(void) {
+    if (!VELOCE_FP8_LUT_READY) {
+        for (int b = 0; b < 256; b++) {
+            const float v = veloce_e4m3_to_float((uint8_t)b);
+            for (int s = 0; s < 8; s++) VELOCE_FP8_LUT[b][s] = v;
+        }
+        VELOCE_FP8_LUT_READY = 1;
+    }
+    return &VELOCE_FP8_LUT[0][0];
+}
+#define VELOCE_F8(b) (veloce_fp8_lut_init(), VELOCE_FP8_LUT[b][0])
+
+/* Number of bytes a row of `k` fp8 values occupies (1 per byte). */
+static inline size_t veloce_fp8_rowbytes(size_t k) { return k; }
+
+static inline float veloce_fp8_dot_lut(const float *x, const uint8_t *w,
+                                       size_t base, size_t K) {
+    float a0 = 0.f, a1 = 0.f;
+    const uint8_t *wr = w + base;
+    size_t q = 0;
+    for (; q + 2 <= K; q += 2) {
+        a0 += x[q] * VELOCE_F8(wr[q]);
+        a1 += x[q + 1] * VELOCE_F8(wr[q + 1]);
+    }
+    float acc = a0 + a1;
+    for (; q < K; q++) acc += x[q] * VELOCE_F8(wr[q]);
+    return acc;
+}
+
+#if defined(__AVX2__) && !defined(VELOCE_NO_AVX2)
+/* AVX2 fp8 dot: 8 weights per iteration.  AVX2 has no E4M3 decode, so the
+ * bytes go through the LUT and are assembled into a vector with set_ps.  The
+ * win over the scalar loop is the fused multiply-add and the single
+ * horizontal reduction, not the decode. */
+static inline float veloce_fp8_dot_avx2(const float *x, const uint8_t *w,
+                                        size_t base, size_t K) {
+    __m256 acc = _mm256_setzero_ps();
+    const uint8_t *wr = w + base;
+    size_t q = 0;
+    for (; q + 8 <= K; q += 8) {
+        const __m256 wv = _mm256_set_ps(
+            VELOCE_F8(wr[q + 7]), VELOCE_F8(wr[q + 6]),
+            VELOCE_F8(wr[q + 5]), VELOCE_F8(wr[q + 4]),
+            VELOCE_F8(wr[q + 3]), VELOCE_F8(wr[q + 2]),
+            VELOCE_F8(wr[q + 1]), VELOCE_F8(wr[q]));
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + q), wv, acc);
+    }
+    float tail = 0.0f;
+    for (; q < K; q++) tail += x[q] * VELOCE_F8(wr[q]);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    s4 = _mm_hadd_ps(s4, s4); s4 = _mm_hadd_ps(s4, s4);
+    return tail + _mm_cvtss_f32(s4);
+}
+#endif
+
+static inline float veloce_fp8_dot(const float *x, const uint8_t *w,
+                                   size_t base, size_t K) {
+#if defined(__AVX2__) && !defined(VELOCE_NO_AVX2)
+    return veloce_fp8_dot_avx2(x, w, base, K);
+#else
+    return veloce_fp8_dot_lut(x, w, base, K);
+#endif
+}
+
+typedef struct { float *out; const float *x; const uint8_t *w; size_t M, K, N; } veloce_mm_fp8_ctx;
+static inline void veloce_mm_fp8_gemv_row(void *vctx, size_t j) {
+    const veloce_mm_fp8_ctx *c = (const veloce_mm_fp8_ctx *)vctx;
+    c->out[j] = veloce_fp8_dot(c->x, c->w, j * c->K, c->K);
+}
+static inline void veloce_mm_fp8_mat_row(void *vctx, size_t i) {
+    const veloce_mm_fp8_ctx *c = (const veloce_mm_fp8_ctx *)vctx;
+    const float *xr = c->x + i * c->K;
+    for (size_t j = 0; j < c->N; j++)
+        c->out[i * c->N + j] = veloce_fp8_dot(xr, c->w, j * c->K, c->K);
+}
+/* x: [M,K] f32, w: [N,K] fp8 E4M3 (1/byte, FLAT), out: [M,N] f32. */
+static inline void veloce_matmul_fp8(float *out, const float *x, const uint8_t *w,
+                                     size_t M, size_t K, size_t N) {
+    /* Build the decode table before the fork-join so concurrent workers never
+     * race on it (it is a fixed static, so this is not a heap allocation). */
+    (void)veloce_fp8_lut_init();
+    veloce_mm_fp8_ctx c = { out, x, w, M, K, N };
+    const size_t row_bytes = veloce_fp8_rowbytes(K);
+    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_fp8_gemv_row, &c);
+    else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_fp8_mat_row, &c);
+}
+
+/* Row-scaled fp8 matmul: w [N,K] fp8, scales [N] f32. */
+typedef struct { float *out; const float *x; const uint8_t *w; const float *s;
+                 size_t M, K, N; } veloce_mm_fp8s_ctx;
+static inline void veloce_mm_fp8s_gemv_row(void *vctx, size_t j) {
+    const veloce_mm_fp8s_ctx *c = (const veloce_mm_fp8s_ctx *)vctx;
+    c->out[j] = c->s[j] * veloce_fp8_dot(c->x, c->w, j * c->K, c->K);
+}
+static inline void veloce_mm_fp8s_mat_row(void *vctx, size_t i) {
+    const veloce_mm_fp8s_ctx *c = (const veloce_mm_fp8s_ctx *)vctx;
+    const float *xr = c->x + i * c->K;
+    for (size_t j = 0; j < c->N; j++)
+        c->out[i * c->N + j] = c->s[j] * veloce_fp8_dot(xr, c->w, j * c->K, c->K);
+}
+static inline void veloce_matmul_fp8_s(float *out, const float *x, const uint8_t *w,
+                                       const float *scales, size_t M, size_t K, size_t N) {
+    (void)veloce_fp8_lut_init();
+    veloce_mm_fp8s_ctx c = { out, x, w, scales, M, K, N };
+    const size_t row_bytes = veloce_fp8_rowbytes(K) + sizeof(float);
+    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_fp8s_gemv_row, &c);
+    else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_fp8s_mat_row, &c);
+}
+
 /* fp16-weight matmul in HF [N,K] (out,in) layout: out[m,n] = dot(x[m,:], w[n,:]). */
 typedef struct { float *out; const float *x; const uint16_t *w; size_t M, K, N; } veloce_mm_f16t_ctx;
 static inline void veloce_mm_f16t_row(void *vctx, size_t i) {

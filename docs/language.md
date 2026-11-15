@@ -64,7 +64,22 @@ extern fn host_helper(x: f32[D]) -> f32[D]     # provided by the host (C ABI)
 ```
 
 Parameters and returns are tensors or scalars. A tensor parameter may be a
-`trit`/`fp16` *storage* tensor (weights); it is passed as a packed pointer.
+`trit`/`i4`/`i2`/`fp8`/`fp16` *storage* tensor (weights); it is passed as a
+packed pointer.
+
+A parameter prefixed with `rw` is a **caller-owned mutable buffer**:
+
+```veloce
+fn append(rw cache: f32[CT, D], pos: i32, row: f32[1, D]) -> f32[1, D] {
+    cache[pos] = row        # writes through to the caller's memory
+    return row
+}
+```
+
+The buffer is never allocated by the generated code and never copied in or
+out, so a host loop can keep it alive across calls — that is how a KV cache is
+built (`examples/kv_decode.vel`). Only `rw` parameters and `let` bindings can
+be written to.
 
 ## Statements
 
@@ -73,7 +88,8 @@ let x = expr            # mutable binding (reassignable)
 const y = expr          # immutable binding
 let a, b = fn(...)      # multiple binding from a multi-return call
 x = expr                # assignment (target must be `let`)
-v[i] = expr             # element / row write on a mutable tensor
+v[i] = expr             # element write (1-D), or whole-row write on a 2-D tensor
+m[i, j] = expr          # element write on a 2-D tensor
 return expr
 return a, b
 if cond { ... } else { ... }
@@ -98,6 +114,12 @@ continue
 | `matmul(a, b)` / `a @ b` | `[M,K] @ [K,N] -> [M,N]` | float weights |
 | `matmul_trit(x, w)` | `[M,K], trit[N,K] -> [M,N]` | **add/sub only**; `w` is `[out, in]` |
 | `matmul_i4(x, w)` | `[M,K], i4[N,K] -> [M,N]` | 4-bit signed weights, 2 per byte; `w` is `[out, in]` |
+| `matmul_i2(x, w)` | `[M,K], i2[N,K] -> [M,N]` | 2-bit signed weights, 4 per byte, values in `[-2, 1]` |
+| `matmul_fp8(x, w)` | `[M,K], fp8[N,K] -> [M,N]` | E4M3 weights, 1 byte each, decoded to f32 in the dot |
+| `matmul_i4g(x, w, s)` | `[M,K], i4[N,K], f32[N,G] -> [M,N]` | per-group scales; `G` must divide `K` |
+| `matmul_trit_s(x, w, s)` | `[M,K], trit[N,K], f32[N] -> [M,N]` | one scale per output row |
+| `matmul_i2_s(x, w, s)` | `[M,K], i2[N,K], f32[N] -> [M,N]` | one scale per output row |
+| `matmul_fp8_s(x, w, s)` | `[M,K], fp8[N,K], f32[N] -> [M,N]` | one scale per output row |
 | `rmsnorm(x, w)` | `[T,D], [D] -> [T,D]` | row-wise RMS norm with gain |
 | `silu(x)` / `relu(x)` | `[..] -> [..]` | activation |
 | `softmax(x)` | `[T,N] -> [T,N]` | row-wise softmax |

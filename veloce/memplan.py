@@ -171,7 +171,8 @@ class Planner:
             t = getattr(e, "ctype", None)
             if not root and isinstance(t, ast.TensorType) and getattr(e, "lower", None) in (
                     "matmul_f32", "matmul_trit", "matmul_trit_s", "matmul_i4",
-                    "matmul_i4g", "matmul_f16wt", "rmsnorm", "silu", "relu",
+                    "matmul_i4g", "matmul_f16wt", "matmul_i2", "matmul_i2_s",
+                    "matmul_fp8", "matmul_fp8_s", "rmsnorm", "silu", "relu",
                     "softmax", "rope", "rope_heads", "embedding", "transpose",
                     "rowmax", "embedding_seq", "meanpool", "zeros"):
                 words = self._words(t)

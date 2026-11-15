@@ -35,8 +35,10 @@ make demo
 # (first run auto-creates .venv and installs NumPy from requirements-test.txt)
 make test
 
-# End-to-end examples: transformer vs NumPy, and train -> ternarize -> deploy
+# End-to-end examples: transformer vs NumPy, KV-cache decoding, and
+# train -> ternarize -> deploy
 make examples
+make kv
 make train
 
 # Measure real kernel/model throughput against the PRD targets

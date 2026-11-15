@@ -15,6 +15,8 @@ manifest = {"align": 64,
 dtype layout:
     trit : flat base-3 packed, 5 trits per byte  ((numel + 4) // 5 bytes)
     i4   : flat 4-bit packed, 2 signed nibbles per byte ((numel + 1) // 2)
+    i2   : flat 2-bit packed, 4 signed values per byte ((numel + 3) // 4)
+    fp8  : E4M3, one byte per value
     fp16 : uint16 little-endian
     f32  : float32 little-endian
 """
@@ -97,6 +99,98 @@ def unpack_trits_array(data, n):
     return vals.reshape(-1)[:n]
 
 
+def pack_i2(values):
+    """Pack signed ints in [-2, 1] into bytes, 4 per byte (low slot first).
+
+    Slot k of a byte holds element 4b + k, sign-extended from 2 bits.  This is
+    the narrowest dtype in the PRD: a 7B model's weights cost 1.75 GB.
+    """
+    import numpy as np
+    flat = _as_int64_flat(values)
+    n = flat.size
+    if n and (int(flat.min()) < -2 or int(flat.max()) > 1):
+        bad = int(flat[(flat < -2) | (flat > 1)][0])
+        raise ValueError(f"i2 value out of range [-2, 1]: {bad}")
+    pad = (-n) % 4
+    if pad:
+        flat = np.concatenate([flat, np.zeros(pad, dtype=np.int64)])
+    b = (flat & 0x03).reshape(-1, 4)
+    packed = b[:, 0] | (b[:, 1] << 2) | (b[:, 2] << 4) | (b[:, 3] << 6)
+    return packed.astype(np.uint8).tobytes()
+
+
+def unpack_i2(data, n):
+    """Inverse of pack_i2 (for tooling/tests)."""
+    out = []
+    for i in range(n):
+        b = data[i // 4]
+        v = (b >> (2 * (i % 4))) & 0x03
+        out.append(v - 4 if v >= 2 else v)
+    return out
+
+
+# --- fp8 E4M3 (bias 7) -------------------------------------------------
+# The bit layout is the checkpoint's, so an E4M3 tensor maps zero-copy; the
+# runtime decodes a byte to f32 during the dot product (see
+# veloce_e4m3_to_float, which this table must agree with bit for bit).
+E4M3_MAX = 448.0
+
+
+def fp8_encode_scalar(v):
+    """Round a Python float to the nearest E4M3 byte (round-half-to-even)."""
+    import math
+    if v != v:                      # NaN
+        return 0x7F
+    sign = 0x80 if math.copysign(1.0, v) < 0 else 0
+    a = abs(float(v))
+    if a == float("inf"):
+        return sign | 0x7E          # saturate: E4M3 has no infinity
+    if a > E4M3_MAX:
+        a = E4M3_MAX
+    if a < 2.0 ** -9:               # below half the smallest subnormal
+        return sign
+    if a < 2.0 ** -6:               # subnormal: mantissa steps of 2^-9
+        man = int(round(a / (2.0 ** -9)))
+        if man >= 8:                # rounded up into the normal range
+            return sign | (1 << 3)
+        return sign | man
+    exp = math.floor(math.log2(a))
+    exp = max(-6, min(8, exp))
+    man = int(round((a / (2.0 ** exp) - 1.0) * 8))
+    if man >= 8:                    # mantissa overflow bumps the exponent
+        man = 0
+        exp += 1
+    if exp > 8:                     # 2^9 * 1.0 = 512 -> saturate
+        return sign | 0x7E
+    return sign | ((exp + 7) << 3) | man
+
+
+def pack_fp8(values):
+    """Encode floats as E4M3 bytes, one byte per value."""
+    import numpy as np
+    flat = np.asarray(values, dtype=np.float64).reshape(-1)
+    return bytes(fp8_encode_scalar(float(v)) for v in flat)
+
+
+def unpack_fp8(data, n):
+    """Decode E4M3 bytes to floats (mirrors veloce_e4m3_to_float)."""
+    out = []
+    for i in range(n):
+        b = data[i]
+        sign = -1.0 if b & 0x80 else 1.0
+        exp = (b >> 3) & 0x0F
+        man = b & 0x07
+        if exp == 0:
+            v = man * (1.0 / 8.0) * (1.0 / 64.0)
+        elif exp == 15 and man == 7:
+            v = 0.0
+        else:
+            p = 2.0 ** (exp - 7)
+            v = p * (1.0 + man * (1.0 / 8.0))
+        out.append(sign * v)
+    return out
+
+
 def _encode(dtype, array):
     import numpy as np
     arr = np.asarray(array)
@@ -105,6 +199,10 @@ def _encode(dtype, array):
         return pack_trits(arr.reshape(-1)), numel
     if dtype == "i4":
         return pack_i4(arr.reshape(-1)), numel
+    if dtype == "i2":
+        return pack_i2(arr.reshape(-1)), numel
+    if dtype == "fp8":
+        return pack_fp8(arr.reshape(-1)), numel
     if dtype == "fp16":
         return arr.astype(np.float16).tobytes(), numel
     if dtype == "f32":
@@ -252,6 +350,12 @@ class VeloceFile:
         if dt == "i4":
             flat = unpack_i4(blob, e["numel"])
             return np.array(flat, dtype=np.int8).reshape(dims)
+        if dt == "i2":
+            flat = unpack_i2(blob, e["numel"])
+            return np.array(flat, dtype=np.int8).reshape(dims)
+        if dt == "fp8":
+            flat = unpack_fp8(blob, e["numel"])
+            return np.array(flat, dtype=np.float32).reshape(dims)
         if dt == "fp16":
             return np.frombuffer(blob, dtype="<f2").reshape(dims)
         if dt == "f32":

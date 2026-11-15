@@ -89,6 +89,12 @@ class Var(Expr):
 class Index(Expr):
     base: Expr = None
     index: Expr = None
+    # Set by the checker when this index is an assignment target: the
+    # element type for `m[i, j]`, the row type for `m[i]` on a 2-D tensor.
+    ctype: Any = None
+    # True when the target is a whole row (`m[i] = vector`), so codegen emits
+    # a row copy instead of an element store.
+    row_store: bool = False
 
 
 @dataclass

@@ -26,7 +26,7 @@ VENV_PY  := $(VENV)/bin/python
 VENV_REQ := requirements-test.txt
 VENV_STAMP := $(VENV)/.requirements.stamp
 
-.PHONY: all demo test examples train bench bench-midi plan bench-throughput venv doctor clean
+.PHONY: all demo test examples kv train bench bench-midi plan bench-throughput venv doctor clean
 
 all: $(VDIR)/transformer_block.c $(VDIR)/tiny_lm.c $(VDIR)/tiny_lm_cls.c $(VDIR)/hello.c
 
@@ -63,6 +63,10 @@ test: $(VENV_STAMP)
 examples: $(VENV_STAMP)
 	@echo "=== transformer block vs NumPy reference ==="
 	@$(VENV_PY) examples/run_transformer.py
+
+kv: $(VENV_STAMP)
+	@echo "=== KV-cache decoding vs NumPy reference ==="
+	@$(VENV_PY) examples/run_kv_decode.py
 
 train: $(VENV_STAMP)
 	@$(VENV_PY) examples/train_tiny_lm.py
