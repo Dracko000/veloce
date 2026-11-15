@@ -3,3 +3,12 @@ build/
 __pycache__/
 *.pyc
 *.o
+*.so
+*.bin
+
+# scratch probe modules kept locally, not part of the project
+examples/codegen_lm.vel
+examples/codegen_many.vel
+examples/codegen_multi.vel
+examples/codegen_multi10.vel
+examples/midi_lm_05b.vel

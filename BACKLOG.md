@@ -12,6 +12,33 @@ Rules for every run:
 * Commit only when the suites are green, one coherent change per commit.
 * If a claim in the docs is wrong, fix the docs — do not weaken the test.
 
+## Git rules (every run)
+
+Remote: `origin` = https://github.com/Dracko000/veloce (public, branch `main`,
+authenticated as Dracko000 via `gh`). There is no upstream and no fork.
+
+* Commit **and push** every run that produces a verified change. Leaving work
+  uncommitted is a failure of the run, not a neutral outcome.
+* Push only when both suites are green and `git status` shows nothing you did
+  not intend to include.
+* Never commit: `.venv/`, `build/`, `__pycache__/`, `*.so`, `*.bin`, or the
+  scratch `examples/codegen_*.vel` / `examples/midi_lm_05b.vel` modules (all
+  ignored in `.gitignore` — do not `git add -f` them).
+* Never commit secrets. Before pushing, scan what you are about to commit:
+  `git ls-files -co --exclude-standard | grep -v '^BACKLOG.md$' | xargs -r grep -lniE "api[_-]?key|secret|ghp_|sk-[A-Za-z0-9]{16,}|password|PRIVATE KEY"`
+  must print nothing. `BACKLOG.md` is excluded only because it quotes this
+  pattern; never exclude anything else. If the scan prints a file, stop and
+  report it instead of pushing.
+* One coherent change per commit; message style `feat:` / `fix:` / `docs:` /
+  `test:` with a body explaining *why*, as in the existing commits.
+* Author identity is already configured per-command in the job prompt; use
+  `git -c user.name="Dracko000" -c user.email="Dracko000@users.noreply.github.com" commit`.
+* After pushing, confirm `git rev-parse HEAD` equals `git rev-parse origin/main`
+  and include the commit hash in the report. Do not claim a push you did not
+  verify.
+* If a push fails (auth, network, non-fast-forward), report the exact error.
+  Never force-push and never rewrite published history.
+
 ## Open
 
 ### 1. Documentation is stale (highest priority, blocks nothing)
