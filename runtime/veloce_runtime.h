@@ -1312,6 +1312,57 @@ static inline void veloce_matmul_i2_s(float *out, const float *x, const uint8_t 
 }
 
 /* ------------------------------------------------------------------ */
+/* Group-scaled i2 matmul (real 2-bit checkpoints).                    */
+/*   w: [N,K] packed i2, scales: [N, K/G] f32.                         */
+/*   out[m,n] = sum_g scales[n,g] * sum_{k in g} x[m,k] * i2(w[n,k])   */
+/* Same contract as `matmul_i4g`: the caller passes the group SIZE and */
+/* the group count must divide K exactly (enforced by the typechecker),*/
+/* so `K / G` here is the exact number of groups per row.              */
+/* ------------------------------------------------------------------ */
+static inline float veloce_i2_dot_scaled(const float *x, const uint8_t *w,
+                                         const float *scales, size_t base,
+                                         size_t K, size_t G) {
+    float acc = 0.0f;
+    const size_t groups = G ? K / G : 0;
+    for (size_t g = 0; g < groups; g++) {
+        float part = veloce_i2_dot(x + g * G, w, base + g * G, G);
+        acc += part * scales[g];
+    }
+    /* Ragged tail: only reachable when K is not a multiple of G, which the
+     * typechecker rejects for literal dims.  Symbolic dims that resolve
+     * badly still produce the mathematically consistent answer here. */
+    size_t done = groups * G;
+    if (done < K) {
+        float part = veloce_i2_dot(x + done, w, base + done, K - done);
+        acc += part * scales[groups];
+    }
+    return acc;
+}
+typedef struct { float *out; const float *x; const uint8_t *w; const float *s;
+                 size_t M, K, N, G; } veloce_mm_i2g_ctx;
+static inline void veloce_mm_i2g_gemv_row(void *vctx, size_t j) {
+    const veloce_mm_i2g_ctx *c = (const veloce_mm_i2g_ctx *)vctx;
+    c->out[j] = veloce_i2_dot_scaled(c->x, c->w, c->s + j * (c->K / c->G),
+                                     j * c->K, c->K, c->G);
+}
+static inline void veloce_mm_i2g_mat_row(void *vctx, size_t i) {
+    const veloce_mm_i2g_ctx *c = (const veloce_mm_i2g_ctx *)vctx;
+    const float *xr = c->x + i * c->K;
+    const size_t ng = c->K / c->G;
+    for (size_t j = 0; j < c->N; j++)
+        c->out[i * c->N + j] = veloce_i2_dot_scaled(xr, c->w, c->s + j * ng,
+                                                    j * c->K, c->K, c->G);
+}
+static inline void veloce_matmul_i2g(float *out, const float *x, const uint8_t *w,
+                                     const float *scales, size_t M, size_t K,
+                                     size_t N, size_t G) {
+    veloce_mm_i2g_ctx c = { out, x, w, scales, M, K, N, G };
+    const size_t row_bytes = veloce_i2_rowbytes(K) + (K / G) * sizeof(float);
+    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_i2g_gemv_row, &c);
+    else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_i2g_mat_row, &c);
+}
+
+/* ------------------------------------------------------------------ */
 /* fp8 weights (FR-1.1): E4M3 (bias 7), one byte per value.            */
 /*   sign | 4-bit exponent | 3-bit mantissa                            */
 /*   finite range +/-448, smallest normal 2^-6, subnormals 2^-9 * m    */
@@ -1457,6 +1508,52 @@ static inline void veloce_matmul_fp8_s(float *out, const float *x, const uint8_t
     const size_t row_bytes = veloce_fp8_rowbytes(K) + sizeof(float);
     if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_fp8s_gemv_row, &c);
     else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_fp8s_mat_row, &c);
+}
+
+/* ------------------------------------------------------------------ */
+/* Group-scaled fp8 matmul: w [N,K] E4M3, scales [N, K/G] f32.         */
+/* Same contract as `matmul_i4g` / `matmul_i2g`: the group count must  */
+/* divide K exactly, so `K / G` is the exact number of groups.         */
+/* ------------------------------------------------------------------ */
+static inline float veloce_fp8_dot_scaled(const float *x, const uint8_t *w,
+                                          const float *scales, size_t base,
+                                          size_t K, size_t G) {
+    float acc = 0.0f;
+    const size_t groups = G ? K / G : 0;
+    for (size_t g = 0; g < groups; g++) {
+        float part = veloce_fp8_dot(x + g * G, w, base + g * G, G);
+        acc += part * scales[g];
+    }
+    size_t done = groups * G;
+    if (done < K) {
+        float part = veloce_fp8_dot(x + done, w, base + done, K - done);
+        acc += part * scales[groups];
+    }
+    return acc;
+}
+typedef struct { float *out; const float *x; const uint8_t *w; const float *s;
+                 size_t M, K, N, G; } veloce_mm_fp8g_ctx;
+static inline void veloce_mm_fp8g_gemv_row(void *vctx, size_t j) {
+    const veloce_mm_fp8g_ctx *c = (const veloce_mm_fp8g_ctx *)vctx;
+    c->out[j] = veloce_fp8_dot_scaled(c->x, c->w, c->s + j * (c->K / c->G),
+                                      j * c->K, c->K, c->G);
+}
+static inline void veloce_mm_fp8g_mat_row(void *vctx, size_t i) {
+    const veloce_mm_fp8g_ctx *c = (const veloce_mm_fp8g_ctx *)vctx;
+    const float *xr = c->x + i * c->K;
+    const size_t ng = c->K / c->G;
+    for (size_t j = 0; j < c->N; j++)
+        c->out[i * c->N + j] = veloce_fp8_dot_scaled(xr, c->w, c->s + j * ng,
+                                                     j * c->K, c->K, c->G);
+}
+static inline void veloce_matmul_fp8g(float *out, const float *x, const uint8_t *w,
+                                      const float *scales, size_t M, size_t K,
+                                      size_t N, size_t G) {
+    (void)veloce_fp8_lut_init();
+    veloce_mm_fp8g_ctx c = { out, x, w, scales, M, K, N, G };
+    const size_t row_bytes = veloce_fp8_rowbytes(K) + (K / G) * sizeof(float);
+    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_fp8g_gemv_row, &c);
+    else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_fp8g_mat_row, &c);
 }
 
 /* fp16-weight matmul in HF [N,K] (out,in) layout: out[m,n] = dot(x[m,:], w[n,:]). */

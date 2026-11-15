@@ -173,10 +173,16 @@ def pack_fp8(values):
 
 
 def unpack_fp8(data, n):
-    """Decode E4M3 bytes to floats (mirrors veloce_e4m3_to_float)."""
+    """Decode E4M3 bytes to floats (mirrors veloce_e4m3_to_float).
+
+    `data` may be `bytes` or a NumPy `uint8` array; the byte is coerced to a
+    Python int first because NumPy's unsigned arithmetic wraps -- `exp - 7`
+    on a `uint8` underflows to 249 and the decode returns ~1e77 instead of a
+    finite value.
+    """
     out = []
     for i in range(n):
-        b = data[i]
+        b = int(data[i])
         sign = -1.0 if b & 0x80 else 1.0
         exp = (b >> 3) & 0x0F
         man = b & 0x07

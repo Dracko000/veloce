@@ -586,25 +586,32 @@ class Checker:
             return ast.TensorType(ast.ScalarType("i32"), (dims[0], dims[1]))
         raise TypeError_("zeros_i32 takes 1 or 2 dimensions", e.line, e.col)
 
-    def bi_matmul_i4g(self, e):
-        """matmul_i4g(x: f32[M,K], w: i4[N,K], scales: f32[N,G]) -> f32[M,N]."""
-        lt = self._tensor_arg(e, 0, "matmul_i4g", e)
-        wt = self._tensor_arg(e, 1, "matmul_i4g", e)
-        st = self._tensor_arg(e, 2, "matmul_i4g", e)
-        if wt.dtype.name != "i4":
-            raise TypeError_("matmul_i4g requires an i4 weight tensor", e.line, e.col)
+    def _group_scaled_matmul(self, e, fname, dtype, label):
+        """matmul_Xg(x: f32[M,K], w: X[N,K], scales: f32[N,G]) -> f32[M,N].
+
+        Shared by `matmul_i4g`, `matmul_i2g` and `matmul_fp8g`: the only
+        difference between the three is the weight dtype and the kernel the
+        backend lowers to.
+        """
+        lt = self._tensor_arg(e, 0, fname, e)
+        wt = self._tensor_arg(e, 1, fname, e)
+        st = self._tensor_arg(e, 2, fname, e)
+        if wt.dtype.name != dtype:
+            raise TypeError_(f"{fname} requires a {dtype} ({label}) weight tensor",
+                             e.line, e.col)
         if st.dtype.name != "f32" or st.rank != 2:
-            raise TypeError_("matmul_i4g scales must be f32[N, groups]", e.line, e.col)
+            raise TypeError_(f"{fname} scales must be f32[N, groups]", e.line, e.col)
         if lt.rank != 2 or wt.rank != 2:
-            raise TypeError_("matmul_i4g requires 2-D tensors", e.line, e.col)
+            raise TypeError_(f"{fname} requires 2-D tensors", e.line, e.col)
         if not (lt.dims[1].is_symbol or wt.dims[1].is_symbol
                 or lt.dims[1].value == wt.dims[1].value):
-            raise TypeError_("matmul_i4g inner dimension mismatch", e.line, e.col)
+            raise TypeError_(f"{fname} inner dimension mismatch", e.line, e.col)
         if not (wt.dims[0].is_symbol or st.dims[0].is_symbol
                 or wt.dims[0].value == st.dims[0].value):
-            raise TypeError_("matmul_i4g scales rows must match output features", e.line, e.col)
+            raise TypeError_(f"{fname} scales rows must match output features",
+                             e.line, e.col)
         # Group count must divide K exactly: the runtime is handed a group
-        # *size* and derives the count back as ceil(K / G), so a ragged shape
+        # *size* and derives the count back as K / G, so a ragged shape
         # (K=100 over 7 groups) would silently scale rows against the wrong
         # slices.  Symbolic dims can't be checked here; they are resolved by
         # the time codegen runs.
@@ -612,12 +619,21 @@ class Checker:
         if not (k.is_symbol or ng.is_symbol):
             if ng.value <= 0 or k.value % ng.value != 0:
                 raise TypeError_(
-                    f"matmul_i4g: scales declare {ng.value} group(s) but the "
+                    f"{fname}: scales declare {ng.value} group(s) but the "
                     f"inner dimension is K={k.value}; the group count must "
                     f"divide K exactly", e.line, e.col)
-        e.lower = "matmul_i4g"
-        self.diag["i4_matmul"] = self.diag.get("i4_matmul", 0) + 1
+        e.lower = fname
+        self.diag[f"{dtype}_matmul"] = self.diag.get(f"{dtype}_matmul", 0) + 1
         return ast.TensorType(ast.ScalarType(FLOAT_PRIM), (lt.dims[0], wt.dims[0]))
+
+    def bi_matmul_i4g(self, e):
+        return self._group_scaled_matmul(e, "matmul_i4g", "i4", "4-bit")
+
+    def bi_matmul_i2g(self, e):
+        return self._group_scaled_matmul(e, "matmul_i2g", "i2", "2-bit")
+
+    def bi_matmul_fp8g(self, e):
+        return self._group_scaled_matmul(e, "matmul_fp8g", "fp8", "E4M3")
 
     def bi_matmul_trit_s(self, e):
         """matmul_trit_s(x, w: trit[N,K], scales: f32[N]) -> f32[M,N]."""

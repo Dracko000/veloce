@@ -288,6 +288,71 @@ fn g(x: f32[M, K], w: fp8[N, K], s: f32[N]) -> f32[M, N] {
         self.assertIn("veloce_matmul_fp8(", c)
         self.assertIn("veloce_matmul_fp8_s(", c)
 
+    def test_group_scaled_codegen(self):
+        """`matmul_i2g`/`matmul_fp8g` lower to their own runtime symbols.
+
+        The group SIZE is derived from the scale tensor's shape exactly like
+        `matmul_i4g` (K // n_groups, never a floor that disagrees with the
+        runtime), and all three share one lowering path.
+        """
+        src = """module t
+dim M = 2
+dim K = 64
+dim N = 8
+dim NG = 16
+fn a(x: f32[M, K], w: i2[N, K], s: f32[N, NG]) -> f32[M, N] {
+    return matmul_i2g(x, w, s)
+}
+fn b(x: f32[M, K], w: fp8[N, K], s: f32[N, NG]) -> f32[M, N] {
+    return matmul_fp8g(x, w, s)
+}
+fn c(x: f32[M, K], w: i4[N, K], s: f32[N, NG]) -> f32[M, N] {
+    return matmul_i4g(x, w, s)
+}
+"""
+        c = veloce.compile_source(src, module_name="t").c_source
+        self.assertIn("veloce_matmul_i2g(", c)
+        self.assertIn("veloce_matmul_fp8g(", c)
+        self.assertIn("veloce_matmul_i4g(", c)
+        # K=64 over NG=16 groups -> group size 4, passed as the last argument.
+        for sym in ("veloce_matmul_i2g(", "veloce_matmul_fp8g(",
+                    "veloce_matmul_i4g("):
+            line = next(ln for ln in c.splitlines() if sym in ln)
+            self.assertTrue(line.rstrip().endswith("4);"), line)
+
+    def test_group_scaled_rejects_wrong_dtype(self):
+        """A group-scaled kernel demands its own weight dtype."""
+        for fn, dt, wrong in (("matmul_i2g", "i2", "i4"),
+                              ("matmul_fp8g", "fp8", "i2")):
+            src = f"""module t
+dim M = 2
+dim K = 64
+dim N = 8
+dim NG = 16
+fn f(x: f32[M, K], w: {wrong}[N, K], s: f32[N, NG]) -> f32[M, N] {{
+    return {fn}(x, w, s)
+}}
+"""
+            with self.assertRaises(TypeError_):
+                veloce.compile_source(src, module_name="t")
+
+    def test_group_scaled_rejects_ragged_groups(self):
+        """The group count must divide K, for every group-scaled kernel."""
+        for fn, dt in (("matmul_i4g", "i4"), ("matmul_i2g", "i2"),
+                       ("matmul_fp8g", "fp8")):
+            src = f"""module t
+dim M = 2
+dim K = 100
+dim N = 4
+dim NG = 7
+fn f(x: f32[M, K], w: {dt}[N, K], s: f32[N, NG]) -> f32[M, N] {{
+    return {fn}(x, w, s)
+}}
+"""
+            with self.assertRaises(TypeError_) as cm:
+                veloce.compile_source(src, module_name="t")
+            self.assertIn("divide K exactly", str(cm.exception))
+
     def test_lowbit_matmul_rejects_wrong_dtype(self):
         """Each low-bit matmul demands its own storage dtype."""
         for fn, dt, wrong in (("matmul_i2", "i2", "i4"), ("matmul_fp8", "fp8", "i2")):

@@ -117,6 +117,8 @@ continue
 | `matmul_i2(x, w)` | `[M,K], i2[N,K] -> [M,N]` | 2-bit signed weights, 4 per byte, values in `[-2, 1]` |
 | `matmul_fp8(x, w)` | `[M,K], fp8[N,K] -> [M,N]` | E4M3 weights, 1 byte each, decoded to f32 in the dot |
 | `matmul_i4g(x, w, s)` | `[M,K], i4[N,K], f32[N,G] -> [M,N]` | per-group scales; `G` must divide `K` |
+| `matmul_i2g(x, w, s)` | `[M,K], i2[N,K], f32[N,G] -> [M,N]` | per-group scales; `G` must divide `K` |
+| `matmul_fp8g(x, w, s)` | `[M,K], fp8[N,K], f32[N,G] -> [M,N]` | per-group scales; `G` must divide `K` |
 | `matmul_trit_s(x, w, s)` | `[M,K], trit[N,K], f32[N] -> [M,N]` | one scale per output row |
 | `matmul_i2_s(x, w, s)` | `[M,K], i2[N,K], f32[N] -> [M,N]` | one scale per output row |
 | `matmul_fp8_s(x, w, s)` | `[M,K], fp8[N,K], f32[N] -> [M,N]` | one scale per output row |

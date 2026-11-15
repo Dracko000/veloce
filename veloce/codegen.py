@@ -442,7 +442,9 @@ class CodeGen:
             M, K = lt.dims[0].value, lt.dims[1].value
             N = rt.dims[0].value
             self.emit(f"veloce_matmul_i4({d}, {x}, {w}, {M}, {K}, {N});")
-        elif lower == "matmul_i4g":
+        elif lower in ("matmul_i4g", "matmul_i2g", "matmul_fp8g"):
+            # One code path for the three group-scaled kernels: identical
+            # contract, only the weight dtype and the runtime symbol differ.
             d = dest or self._dst(e)
             x = self.tptr(e.args[0]); w = self.tptr(e.args[1]); sc = self.tptr(e.args[2])
             lt = getattr(e.args[0], "ctype"); rt = getattr(e.args[1], "ctype")
@@ -450,15 +452,15 @@ class CodeGen:
             M, K = lt.dims[0].value, lt.dims[1].value
             N = rt.dims[0].value
             # The caller declares scales as [N, n_groups] and the runtime takes
-            # the group SIZE, deriving n_groups back as ceil(K / G).  The two
-            # only agree when the group count divides K exactly, which
-            # typecheck enforces; with that guaranteed, K // n_groups is the
-            # exact group size.  (This used to be a bare floor division, which
-            # silently mismatched the runtime for ragged shapes such as K=100
-            # over 7 groups and scaled every row against the wrong slices.)
+            # the group SIZE, deriving n_groups back as K / G.  The two only
+            # agree when the group count divides K exactly, which typecheck
+            # enforces; with that guaranteed, K // n_groups is exact.  (This
+            # used to be a bare floor division, which silently mismatched the
+            # runtime for ragged shapes such as K=100 over 7 groups and scaled
+            # every row against the wrong slices.)
             ngroups = st.dims[1].value
             G = K // ngroups
-            self.emit(f"veloce_matmul_i4g({d}, {x}, {w}, {sc}, {M}, {K}, {N}, {G});")
+            self.emit(f"veloce_{lower}({d}, {x}, {w}, {sc}, {M}, {K}, {N}, {G});")
         elif lower == "matmul_i2":
             d = dest or self._dst(e)
             x = self.tptr(e.args[0]); w = self.tptr(e.args[1])
