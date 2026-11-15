@@ -41,23 +41,7 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. Documentation is stale (highest priority, blocks nothing)
-
-Code landed for `i2`, `fp8`, KV-cache row stores and `matmul_i4g`/`matmul_trit_s`
-coverage, but the docs still say otherwise:
-
-* `docs/implementation-status.md` FR-1.1 says "`i2`/`fp8` are recognised dtype
-  names only" — both now have packed kernels, `_s` variants and `.veloce`
-  round-trip.
-* `docs/model-capabilities.md` says "Prefix caching / KV cache ❌ (v1.0 is T=1,
-  no KV cache)" — row stores work and `examples/kv_decode.vel` proves it.
-* `docs/language.md` builtin table is missing `matmul_i2`, `matmul_i2_s`,
-  `matmul_fp8`, `matmul_fp8_s`, `matmul_i4g`, `matmul_trit_s`; it also does not
-  document `rw` parameters or row assignment (`m[i] = vector`).
-* `README.md` quick-start does not mention `examples/run_kv_decode.py`.
-* `Makefile` has no target for the KV-cache example.
-
-### 2. Orphan example files — decide, do not just commit
+### 1. Orphan example files — decide, do not just commit
 
 These are referenced by nothing (no test, no Makefile target, no doc):
 
@@ -73,31 +57,36 @@ Preferred resolution: make `bench_midi_lm.py` accept `--config`/`--model-dir`
 so one command generates both shapes, then delete the orphan `.vel` files.
 Fallback: delete them and note it in the commit message.
 
-### 3. KV cache in the real benchmark
+### 2. KV cache in the real benchmark
 
 `benchmarks/bench_midi_lm.py` is still T=1 with no cache, so it recomputes the
 whole prefix per token and its tok/s number is not comparable to a real decoder.
 Add a cached path (cache tensors + `rw` parameters + a host loop) and report
 both numbers side by side.
 
-### 4. `matmul_i2` / `matmul_fp8` group-scaled variants
+### 3. `matmul_i2` / `matmul_fp8` group-scaled variants
 
 Only row-scaled (`_s`) exist. Real 2-bit and FP8 checkpoints ship per-group
 scales (`matmul_i2g`, `matmul_fp8g`), like `matmul_i4g`. The group-size
 contract is already established: the group count must divide K exactly.
 
-### 5. Attention masking
+### 4. Attention masking
 
 `softmax` has no additive mask, so a KV cache can only attend over every slot.
 Unwritten slots are zeros and steal probability mass. Needs either a `mask`
 argument on `softmax` or an `-inf` bias vector added to the scores.
 
-### 6. Stale benchmark artefacts
+### 5. Stale benchmark artefacts
 
 `benchmarks/results.json` holds numbers from an older host state; re-run
 `make bench` and commit the fresh file, or state the date in the file.
 
 ## Done (most recent first)
+
+* Documentation brought in line with the code: `i2`/`fp8` kernels and their
+  measured error, the group/row-scaled variants and the "group count must
+  divide K" contract, `rw` parameters and row assignment, the KV-cache example
+  in `README.md`/`Makefile` (`make kv`), and the test counts (28 + 32).
 
 * `i2` (4 values/byte) and `fp8` E4M3: runtime kernels + AVX2 paths, compiler
   lowering, packing, `.veloce` read/write, numeric tests. Measured max |err|
