@@ -41,47 +41,42 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. Orphan example files — decide, do not just commit
-
-These are referenced by nothing (no test, no Makefile target, no doc):
-
-* `examples/codegen_lm.vel`, `codegen_multi.vel`, `codegen_many.vel`,
-  `codegen_multi10.vel` — four ad-hoc next-char decoders differing only in
-  shape and prompt length.
-* `examples/midi_lm_05b.vel` — a 0.5B-shaped variant of `examples/midi_lm.vel`
-  (D=2048/F=5632 vs D=1536/F=6144) that `benchmarks/bench_midi_lm.py` cannot
-  produce, because it hardcodes `MODEL` and always compiles
-  `examples/midi_lm.vel`.
-
-Preferred resolution: make `bench_midi_lm.py` accept `--config`/`--model-dir`
-so one command generates both shapes, then delete the orphan `.vel` files.
-Fallback: delete them and note it in the commit message.
-
-### 2. KV cache in the real benchmark
+### 1. KV cache in the real benchmark
 
 `benchmarks/bench_midi_lm.py` is still T=1 with no cache, so it recomputes the
 whole prefix per token and its tok/s number is not comparable to a real decoder.
 Add a cached path (cache tensors + `rw` parameters + a host loop) and report
 both numbers side by side.
 
-### 3. `matmul_i2` / `matmul_fp8` group-scaled variants
+### 2. `matmul_i2` / `matmul_fp8` group-scaled variants
 
 Only row-scaled (`_s`) exist. Real 2-bit and FP8 checkpoints ship per-group
 scales (`matmul_i2g`, `matmul_fp8g`), like `matmul_i4g`. The group-size
 contract is already established: the group count must divide K exactly.
 
-### 4. Attention masking
+### 3. Attention masking
 
 `softmax` has no additive mask, so a KV cache can only attend over every slot.
 Unwritten slots are zeros and steal probability mass. Needs either a `mask`
 argument on `softmax` or an `-inf` bias vector added to the scores.
 
-### 5. Stale benchmark artefacts
+### 4. Stale benchmark artefacts
 
 `benchmarks/results.json` holds numbers from an older host state; re-run
 `make bench` and commit the fresh file, or state the date in the file.
 
 ## Done (most recent first)
+
+* Orphan example files resolved by generating them instead of keeping them:
+  `veloce/lmmodule.py` renders the decoder module from a shape config, and
+  `bench_midi_lm.py` grew `--config KEY=VAL` / `--model-dir` (plus
+  `--prepare-only`), so one command measures both shapes. The five untracked
+  orphans (`codegen_lm/multi/many/multi10.vel`, `midi_lm_05b.vel`) are
+  deleted. `examples/midi_lm.vel` is now the renderer's default output, and
+  `TestDecoderModule.test_default_render_matches_example` fails if it drifts;
+  `make bench-midi-05b` builds d_model=2048/F=5632/7 layers from the same
+  code path (measured: verify max|err| 3.4e-4, relative 1.9e-6, PASS).
+  Compiler suite 32 -> 37 tests.
 
 * Documentation brought in line with the code: `i2`/`fp8` kernels and their
   measured error, the group/row-scaled variants and the "group count must

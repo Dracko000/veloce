@@ -2,10 +2,10 @@
 """End-to-end mid-size ternary LM: real weights, real mmap, measured tok/s.
 
 This is the honest answer to "how fast is Veloce actually, on a real model?".
-It builds a genuine 275.7M-ternary-parameter decoder (6 layers, d_model=1536,
+It builds a genuine 275.6M-ternary-parameter decoder (6 layers, d_model=1536,
 ffn=6144, vocab=32000), writes it to a ``.veloce`` file with the production
-packing code, then compiles ``examples/midi_lm.vel`` and runs the *generated C*
-against the mmap'd weights.  Every number printed is wall-clock measured on
+packing code, renders + compiles the module with ``veloce.lmmodule`` and runs
+the *generated C* against the mmap'd weights.  Every number printed is wall-clock measured on
 this machine -- nothing is projected from a synthetic microbenchmark.
 
 What is measured
@@ -22,6 +22,12 @@ Usage
     python3 benchmarks/bench_midi_lm.py --rebuild        # regenerate weights
     python3 benchmarks/bench_midi_lm.py --verify         # NumPy cross-check
     python3 benchmarks/bench_midi_lm.py --json out.json
+    python3 benchmarks/bench_midi_lm.py --config D=2048,F=5632,layers=7
+
+``--config`` takes ``key=value`` pairs (``V``, ``D``, ``F``, ``layers``,
+``scale``, ``name``) and ``--model-dir`` sends both the generated module and
+its ``.veloce`` weights there, so several shapes can be measured from one
+command without a hand-written ``.vel`` file per shape.
 """
 import argparse
 import json
@@ -41,14 +47,15 @@ sys.path.insert(0, ROOT)
 import veloce  # noqa: E402
 from veloce import weights as vw  # noqa: E402
 from veloce.codegen import ctype_of  # noqa: E402
+from veloce.lmmodule import (DEFAULT_CONFIG, attn_scale,  # noqa: E402
+                             decoder_module, normalize_config)
 
 CC = os.environ.get("CC", "cc")
 RUNTIME = os.path.join(ROOT, "runtime")
 BUILD = os.path.join(ROOT, "build")
 
-MODEL = dict(V=32000, D=1536, F=6144, layers=6)
+MODEL = dict(DEFAULT_CONFIG)
 EPS = 1e-5
-ATTN_SCALE = 0.0255          # matches examples/midi_lm.vel
 
 CFLAGS = ["-std=c11", "-O3", "-march=native", "-ffast-math", "-pthread"]
 
@@ -101,6 +108,34 @@ def param_counts(cfg):
     }
 
 
+def model_card_name(cfg):
+    """Stable card name derived from the shape, e.g. ``midi-lm-275m-demo``."""
+    trits = param_counts(cfg)["ternary"]
+    m = trits / 1e6
+    tag = f"{m:.0f}m" if m >= 10 else f"{m:.1f}m"
+    return f"midi-lm-{tag}-demo"
+
+
+def parse_config(pairs):
+    """``["D=2048", "layers=7"]`` -> cfg dict merged onto the defaults."""
+    cfg = dict(MODEL)
+    for item in pairs or []:
+        if "=" not in item:
+            raise SystemExit(f"--config expects key=value, got {item!r}")
+        k, v = item.split("=", 1)
+        k = k.strip()
+        if k == "name":
+            cfg["name"] = v.strip()
+        elif k in ("V", "D", "F", "layers"):
+            cfg[k] = int(v)
+        elif k == "scale":
+            cfg["scale"] = float(v)
+        else:
+            raise SystemExit(f"unknown config key {k!r} "
+                             f"(known: V, D, F, layers, scale, name)")
+    return normalize_config(cfg)
+
+
 def build_weights(path, cfg, rebuild=False):
     """Generate + write the .veloce file. Returns (manifest, seconds, rebuilt)."""
     if os.path.exists(path) and not rebuild:
@@ -113,7 +148,7 @@ def build_weights(path, cfg, rebuild=False):
     t0 = time.perf_counter()
     from veloce.capabilities import make_model_card
     card = make_model_card(
-        "midi-lm-275m-demo",
+        model_card_name(cfg),
         model_type="ternary-transformer (untrained throughput demonstrator)",
         params={
             "ternary": param_counts(cfg)["ternary"],
@@ -276,12 +311,19 @@ int main(int argc, char **argv) {
 """
 
 
-def build_and_run(module, c_source, man, cfg, wpath, iters, dump, extra_flags):
-    os.makedirs(BUILD, exist_ok=True)
-    hdr = os.path.join(BUILD, "midi_lm_offsets.h")
+def build_and_run(module, c_source, man, cfg, wpath, iters, dump, extra_flags,
+                  workdir=None):
+    """Compile the generated module + a C driver and time it.
+
+    `workdir` isolates artefacts per shape, so repeated ``--config`` runs do
+    not overwrite each other's offsets header or binary.
+    """
+    work = workdir or BUILD
+    os.makedirs(work, exist_ok=True)
+    hdr = os.path.join(work, "midi_lm_offsets.h")
     write_offsets_header(man, hdr)
 
-    gen_c = os.path.join(BUILD, "midi_lm.c")
+    gen_c = os.path.join(work, "midi_lm.c")
     with open(gen_c, "w") as f:
         f.write(c_source)
 
@@ -289,12 +331,12 @@ def build_and_run(module, c_source, man, cfg, wpath, iters, dump, extra_flags):
            .replace("__EXTERN__", extern_decl(module))
            .replace("__ARGS__", call_args(module))
            .replace("__V__", str(cfg["V"])))
-    drv = os.path.join(BUILD, "midi_lm_driver.c")
+    drv = os.path.join(work, "midi_lm_driver.c")
     with open(drv, "w") as f:
         f.write(src)
 
-    exe = os.path.join(BUILD, "midi_lm_bench")
-    cmd = [CC, *CFLAGS, *extra_flags, "-I", RUNTIME, "-I", BUILD,
+    exe = os.path.join(work, "midi_lm_bench")
+    cmd = [CC, *CFLAGS, *extra_flags, "-I", RUNTIME, "-I", work,
            drv, gen_c, "-lm", "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -352,6 +394,7 @@ def _silu(x):
 
 def reference_logits(vf, tok, cfg):
     V, D = cfg["V"], cfg["D"]
+    cfg_scale = attn_scale(cfg)
     x = vf.numpy("emb")[tok].astype(np.float32)
     for l in range(1, cfg["layers"] + 1):
         nw = vf.numpy(f"nw{l}")
@@ -359,7 +402,8 @@ def reference_logits(vf, tok, cfg):
         q = _tritmm(xn, vf.numpy(f"wq{l}"))
         k = _tritmm(xn, vf.numpy(f"wk{l}"))
         v = _tritmm(xn, vf.numpy(f"wv{l}"))
-        scores = np.array([float(q @ k)], dtype=np.float32) * np.float32(ATTN_SCALE)
+        scores = (np.array([float(q @ k)], dtype=np.float32)
+                  * np.float32(cfg_scale))
         probs = np.exp(scores - scores.max())
         probs = probs / probs.sum()
         # T=1: probs has shape (1,); keep an explicit (1,1) @ (1,D) product
@@ -437,10 +481,30 @@ def main():
     ap.add_argument("--rebuild", action="store_true", help="regenerate weights")
     ap.add_argument("--verify", action="store_true", help="NumPy reference check")
     ap.add_argument("--json", help="write results to this JSON file")
-    ap.add_argument("--weights", default=os.path.join(BUILD, "midi_lm.veloce"))
+    ap.add_argument("--weights", default=None,
+                    help=".veloce weight file (default: <model-dir>/<name>.veloce)")
+    ap.add_argument("--model-dir", default=BUILD,
+                    help="where the generated module and weights live")
+    ap.add_argument("--config", action="append", metavar="KEY=VAL",
+                    help="override V/D/F/layers/scale/name (repeatable)")
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="write module + weights, skip building/running")
     args = ap.parse_args()
 
-    cfg = MODEL
+    cfg = parse_config(args.config)
+    os.makedirs(args.model_dir, exist_ok=True)
+    model_file = os.path.join(args.model_dir, cfg["name"] + ".veloce")
+    if args.weights is None:
+        args.weights = model_file
+    vel_path = os.path.join(args.model_dir, cfg["name"] + ".vel")
+    with open(vel_path, "w") as f:
+        f.write(decoder_module(cfg))
+    print(f"module           : {vel_path} ({cfg['layers']} layers)")
+    if args.prepare_only:
+        man, gen_s, rebuilt = build_weights(args.weights, cfg, args.rebuild)
+        print(f"weights          : {man['total_bytes']/1e6:.1f} MB"
+              f"{' [generated]' if rebuilt else ' [cached]'}")
+        return 0
     counts = param_counts(cfg)
 
     t0 = time.perf_counter()
@@ -473,13 +537,15 @@ def main():
     print(f"streamed / token : {streamed/1e6:.1f} MB (all trits + one emb row)")
     print()
 
-    res = veloce.compile_file(os.path.join(ROOT, "examples", "midi_lm.vel"))
+    res = veloce.compile_file(vel_path)
     print(res.report())
     print()
 
-    dump = os.path.join(BUILD, "midi_lm_logits.bin")
+    work = os.path.join(BUILD, cfg["name"])
+    dump = os.path.join(work, "midi_lm_logits.bin")
     runs, exe = build_and_run(res.module, res.c_source, man, cfg,
-                              args.weights, args.iters, dump, [])
+                              args.weights, args.iters, dump, [],
+                              workdir=work)
 
     def show(title, runs):
         print(f"-- {title} --")

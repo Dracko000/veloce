@@ -7,6 +7,8 @@
 #   make train      train the tiny ternary classifier, pack weights, mmap-deploy
 #   make bench      measure real kernel throughput vs the PRD target
 #   make bench-midi end-to-end 275.6M ternary decoder, measured tok/s
+#   make model-module  re-render examples/midi_lm.vel from veloce/lmmodule.py
+#   make bench-midi-05b  same bench at d_model=2048 (0.5B-shaped config)
 #   make plan       print materialisation savings for the transformer layer
 #   make venv       create .venv and install test dependencies
 #   make doctor     check the local toolchain
@@ -26,7 +28,8 @@ VENV_PY  := $(VENV)/bin/python
 VENV_REQ := requirements-test.txt
 VENV_STAMP := $(VENV)/.requirements.stamp
 
-.PHONY: all demo test examples kv train bench bench-midi plan bench-throughput venv doctor clean
+.PHONY: all demo test examples kv train bench bench-midi bench-midi-05b \
+        model-module plan bench-throughput venv doctor clean
 
 all: $(VDIR)/transformer_block.c $(VDIR)/tiny_lm.c $(VDIR)/tiny_lm_cls.c $(VDIR)/hello.c
 
@@ -81,6 +84,18 @@ bench-throughput: bench
 
 bench-midi: $(VENV_STAMP)
 	@$(VENV_PY) benchmarks/bench_midi_lm.py --verify --json benchmarks/midi_lm_results.json
+
+# Same network, the 0.5B-shaped config.  This is a --config invocation, not a
+# second hand-maintained .vel file: veloce/lmmodule.py renders the module for
+# whatever shape the config names.
+bench-midi-05b: $(VENV_STAMP)
+	@$(VENV_PY) benchmarks/bench_midi_lm.py --config D=2048 --config F=5632 \
+		--config layers=7 --config name=midi_lm_05b --verify
+
+model-module: $(VENV_STAMP)
+	@$(VENV_PY) -c 'from veloce.lmmodule import decoder_module; \
+	              open("examples/midi_lm.vel", "w").write(decoder_module({}))'
+	@echo "re-rendered examples/midi_lm.vel"
 
 doctor:
 	@echo "python:  $$($(PYTHON) --version 2>&1)"

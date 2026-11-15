@@ -415,5 +415,59 @@ class TestVeloceFormat(unittest.TestCase):
                 "bad", capabilities={"coding_agentic": {"status": "maybe"}})
 
 
+class TestDecoderModule(unittest.TestCase):
+    """veloce.lmmodule renders the benchmark module; it must stay in sync."""
+
+    def test_default_render_matches_example(self):
+        """examples/midi_lm.vel is exactly the default config's rendering."""
+        from veloce.lmmodule import decoder_module
+        path = os.path.join(ROOT, "examples", "midi_lm.vel")
+        with open(path) as f:
+            on_disk = f.read()
+        self.assertEqual(on_disk, decoder_module({}),
+                         "examples/midi_lm.vel drifted from veloce/lmmodule.py; "
+                         "run `make model-module`")
+
+    def test_forward_params_follow_config(self):
+        """Layer count, d_model and ffn must reach the rendered signature."""
+        from veloce.lmmodule import decoder_module, param_names
+        cfg = dict(name="t05b", V=256, D=2048, F=5632, layers=7)
+        src = decoder_module(cfg)
+        self.assertIn("module t05b", src)
+        self.assertIn("dim D = 2048", src)
+        self.assertIn("dim F = 5632", src)
+        names = param_names(cfg)
+        self.assertEqual(len(names), 1 + 7 * 8 + 2)
+        self.assertEqual(names[0], "emb")
+        self.assertEqual(names[-2:], ["nwf", "head"])
+        self.assertIn("nw7", names)
+        self.assertIn("w27", names)
+        self.assertNotIn("nw8", names)
+        fn = next(f for f in veloce.parse(veloce.tokenize(src)).functions
+                  if f.name == "forward")
+        # param_names() lists the *weight* tensors; `tok` is a scalar.
+        tensors = [p.name for p in fn.params
+                   if isinstance(p.type, veloce.ast_mod.TensorType)]
+        self.assertEqual(tensors, names)
+
+    def test_scale_defaults_and_override(self):
+        from veloce.lmmodule import attn_scale
+        self.assertAlmostEqual(attn_scale(dict(D=1024)), 1.0 / 32.0)
+        self.assertAlmostEqual(attn_scale(dict(D=1024, scale=0.5)), 0.5)
+
+    def test_renders_compile_to_c(self):
+        """A non-default shape must actually compile, not just render."""
+        from veloce.lmmodule import decoder_module
+        cfg = dict(name="tiny_dm", V=64, D=32, F=64, layers=2)
+        res = veloce.compile_source(decoder_module(cfg), module_name="tiny_dm")
+        self.assertEqual(res.diagnostics["trit_matmul"], 8)
+        self.assertIn("veloce_matmul_trit", res.c_source)
+
+    def test_rejects_bad_config(self):
+        from veloce.lmmodule import decoder_module
+        with self.assertRaises(ValueError):
+            decoder_module(dict(D=0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

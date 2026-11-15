@@ -96,7 +96,12 @@ real module (see `test_erd_introspection`).
 * **End-to-end mid-size model** (`benchmarks/bench_midi_lm.py`): a genuine
   275.6M-ternary-parameter decoder (6 layers, d=1536, ffn=6144, V=32000,
   T=1 without KV cache) built with the production packing code, written as a
-  153.5 MB `.veloce` file and run from a memory map. Measured **22.3 tok/s on
+  153.5 MB `.veloce` file and run from a memory map. The module itself is
+  rendered by `veloce/lmmodule.py` from a shape config, so the same command
+  measures other sizes (`--config D=2048 --config F=5632 --config layers=7`,
+  i.e. `make bench-midi-05b`); `examples/midi_lm.vel` is that renderer's
+  default-config output and `test_default_render_matches_example` fails if the
+  two drift. Measured **22.3 tok/s on
   one thread** (45–50 ms median, 25–26 tok/s best of 21) and 28–36 tok/s on two
   (the spread is host contention);
   the logits match a NumPy reference to 1.4e-6 relative error and hash
@@ -122,7 +127,7 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 28 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel and an `-ffast-math` SiLU saturation regression) + 32 front-end/codegen/packing tests (`test_compiler.py`) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 28 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel and an `-ffast-math` SiLU saturation regression) + 37 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |
