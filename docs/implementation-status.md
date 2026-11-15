@@ -64,18 +64,22 @@ real module (see `test_erd_introspection`).
   `test_fp8_matmul_numeric` check each one is bit-identical across 1/2/4
   threads and across the `.veloce` roundtrip. Measured max |err| vs a float64
   reference: 5.6e-6 (i2, K=1003) and 4.3e-6 (fp8, K=517).
-* **Group- and row-scaled variants** exist for the integer dtypes
-  (`matmul_i4g` takes `f32[N, groups]`, `matmul_trit_s`/`matmul_i2_s`/
-  `matmul_fp8_s` take `f32[N]`). The group count must divide the inner
-  dimension exactly — a ragged count has no single group size, so it is
-  rejected at compile time rather than silently scaling the wrong slices.
+* **Group- and row-scaled variants** exist for every low-bit dtype.
+  `matmul_i4g`/`matmul_i2g`/`matmul_fp8g` take `f32[N, groups]` and share one
+  typechecker rule and one lowering path; `matmul_trit_s`/`matmul_i2_s`/
+  `matmul_fp8_s` take one scale per output row. The group count must divide
+  the inner dimension exactly — a ragged count has no single group size, so it
+  is rejected at compile time rather than silently scaling the wrong slices
+  (`test_group_scaled_rejects_ragged_groups` covers all three kernels).
 * **KV cache (FR-2.1 scope)**: a tensor parameter declared `rw` is a
   caller-owned mutable buffer, and `cache[pos] = row` stores a whole row into
   it, so a host loop can keep keys/values across calls. `examples/kv_decode.vel`
   plus `examples/run_kv_decode.py` decode five tokens this way (max |err|
-  7.7e-7 per token, 1.0e-6 for the cached attention). Attention masking is not
-  implemented yet, so a cache attends over every slot; the shipped example
-  zeroes the cache first and compares against a matching reference.
+  7.7e-7 per token, 1.0e-6 for the cached attention). Attention masking is
+  expressed as an additive `f32[CT]` bias of `-1e30` on the scores, which
+  `softmax` underflows to exactly zero; `test_cached_decode_attention_mask`
+  decodes four tokens through a 1-, 2- and 3-layer cached decoder and checks
+  the result against a strictly causal float64 reference.
 * **FR-4.2 threading policy**: work is split over *independent output*
   elements only (rows for matmul/rmsnorm/softmax, elements for elementwise
   ops), never over a reduction axis, which is why bit-exact determinism is

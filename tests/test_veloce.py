@@ -7,6 +7,7 @@ arrays) or against compiler diagnostics.  A tiny homemade runner keeps the
 project dependency-free.
 """
 import os
+import re
 import sys
 import traceback
 
@@ -1180,21 +1181,19 @@ int main(void) {{
     assert np.abs(got2 - ref2).max() < 1e-4, (got2, ref2)
 
 
-def _quarantine_cached_decode_attention_mask():
-    """KNOWN DEFECT — not collected as a test.
+def test_cached_decode_attention_mask():
+    """A cached decode step must ignore slots past `pos`, at any depth.
 
-    Cached decoding is correct for one layer (`layer_c` and `attn_c` match a
-    float64 reference to ~1e-6 in isolation, verified separately) but a
-    two-layer `forward_cached` diverges at the *second* layer: the output is
-    ~1e30, i.e. a masked score leaked into the visible row. Instrumenting the
-    generated C shows layer 1 exact and layer 2 exploding, with both cache
-    rows (`ck[0]`, `ck[1]`) holding correct values — so the fault is in the
-    copy/scheduling of the second `layer_c` call, not in the kernels or the
-    mask. See BACKLOG.md #2 for the evidence trail.
-
-    Rename back to `test_cached_decode_attention_mask` once fixed.
-
-    A cached decode step must ignore slots past `pos`.
+    This test used to be parked: a two-layer `forward_cached` diverged at
+    ~1e30 on the *second* layer while one layer was exact.  The compiler was
+    never at fault -- the driver built its argument list by hand (all KV
+    caches first, then all weights) while the generated signature interleaves
+    them per layer (`ck1, cv1, nw1, wq1, ..., ck2, cv2, ...`).  For `L == 1`
+    the two orders coincide, which is exactly why only the two-layer case
+    failed: every argument past `cv1` was shifted by two, so layer 2 read
+    layer 1's weights and an `f32[D]` array as a trit matrix.  The argument
+    list is now derived from the parsed signature, and the test runs 1, 2 and
+    3 layers so a per-layer interleaving mistake cannot hide behind `L == 1`.
 
     The mask is a plain f32 bias added to the scores, so the test is a
     numeric one: hidden slots get exactly zero softmax probability, which
@@ -1202,10 +1201,16 @@ def _quarantine_cached_decode_attention_mask():
     the mask the zeros in unwritten slots dilute every row and the reference
     below disagrees.
     """
+    for layers in (1, 2, 3):
+        _check_cached_decode(layers)
+
+
+def _check_cached_decode(L):
+    """One cached decode of four tokens through an `L`-layer decoder."""
     from veloce.lmmodule import MASK_HIDDEN, cached_module
 
-    V, D, F, L, CT = 16, 8, 16, 2, 4
-    cfg = dict(name="kvtest", V=V, D=D, F=F, layers=L)
+    V, D, F, CT = 16, 8, 16, 4
+    cfg = dict(name=f"kvtest{L}", V=V, D=D, F=F, layers=L)
     src = cached_module(cfg, CT)
 
     rng = np.random.default_rng(5)
@@ -1229,10 +1234,9 @@ def _quarantine_cached_decode_attention_mask():
             return vw_pack(w)
         return list(w.flatten())
 
-    decls, args = [], []
-    decls.append(f"static float ck[{L}][{CT*D}] = {{0}};")
-    decls.append(f"static float cv[{L}][{CT*D}] = {{0}};")
-    decls.append(f"static float mask[{CT}];")
+    decls = [f"static float ck[{L}][{CT*D}] = {{0}};",
+             f"static float cv[{L}][{CT*D}] = {{0}};",
+             f"static float mask[{CT}];"]
     # `emb` is fp16 storage: the C runtime takes a uint16_t table.
     decls.append("    " + carr("emb", "uint16_t",
                                list(emb.astype(np.float16).view(np.uint16)
@@ -1244,29 +1248,42 @@ def _quarantine_cached_decode_attention_mask():
     decls.append("    " + carr("nwf", "float", mats["nwf"]))
     decls.append("    " + carr("head", "uint8_t", vw_pack(head)))
 
+    import veloce
+    from veloce.codegen import ctype_of
+    cached_fn = next(f for f in veloce.parse(veloce.tokenize(src)).functions
+                     if f.name == "forward_cached")
+
+    def _cached_arg(name, tok, pos):
+        """C expression for one `forward_cached` parameter, matched by name."""
+        if name == "emb":
+            return "emb"
+        if name == "tok":
+            return str(tok)
+        if name == "pos":
+            return str(pos)
+        if name == "mask":
+            return "mask"
+        m = re.fullmatch(r"(ck|cv)(\d+)", name)
+        if m:
+            return f"{m.group(1)}[{int(m.group(2)) - 1}]"
+        return name  # nw{l}, wq{l}, ..., nwf, head
+
     loop = []
     for t, tok in enumerate(toks):
         loop.append(
             f"    for (int i = 0; i < {CT}; i++) mask[i] = (i <= {t}) ? 0.0f "
             f": {cf(MASK_HIDDEN)};")
-        loop.append(f"    float *o{t} = veloce_forward_cached(" +
-                    ", ".join([f"emb", str(tok), str(t),
-                               "mask"] +
-                              [f"ck[{l}], cv[{l}]" for l in range(L)] +
-                              sum([[f"nw{l}"] + [f"{n}{l}" for n in
-                                   ("wq", "wk", "wv", "wo", "w1", "w2", "w3")]
-                                   for l in range(1, L + 1)], []) +
-                              ["nwf", "head"]) + ");")
+        args = ", ".join(_cached_arg(p.name, tok, t)
+                         for p in cached_fn.params)
+        loop.append(f"    float *o{t} = veloce_forward_cached({args});")
         loop.append(f'    for (int i = 0; i < {V}; i++) '
                     f'printf("t{t} %a\\n", o{t}[i]);')
 
     # Prototype straight from the compiled AST, so it cannot drift from the
     # real signature (a hand-written one silently truncates every pointer).
-    import veloce
-    from veloce.codegen import ctype_of
-    fn = next(f for f in veloce.parse(veloce.tokenize(src)).functions
-              if f.name == "forward_cached")
-    proto = ", ".join(f"{ctype_of(p.type)} {p.name}" for p in fn.params)
+    # The argument list is built from the same parameter list, in the same
+    # order -- see the docstring for what happens when it is not.
+    proto = ", ".join(f"{ctype_of(p.type)} {p.name}" for p in cached_fn.params)
     driver = f"""
 #include "veloce_runtime.h"
 #include <stdio.h>
@@ -1277,7 +1294,7 @@ int main(void) {{
     return 0;
 }}
 """
-    rc, out, err, _ = util.build_and_run(src, driver, name="kv_cached")
+    rc, out, err, _ = util.build_and_run(src, driver, name=f"kv_cached{L}")
     assert rc == 0, err
 
     got = {}
@@ -1289,9 +1306,9 @@ int main(void) {{
     ck = [np.zeros((CT, D)) for _ in range(L)]
     cv = [np.zeros((CT, D)) for _ in range(L)]
     scale = np.float64(1.0 / np.sqrt(D))
-    x = None
+    emb16 = emb.astype(np.float16).astype(np.float64)  # fp16 storage
     for t, tok in enumerate(toks):
-        x = emb[tok].astype(np.float64)
+        x = emb16[tok]
         for l in range(1, L + 1):
             xn = _rmsnorm64(x, nw)
             q = xn @ mats[f"wq{l}"].astype(np.float64).T
@@ -1311,7 +1328,126 @@ int main(void) {{
         xn = _rmsnorm64(x, nw)
         ref = xn @ head.astype(np.float64).T
         err = float(np.abs(np.array(got[f"t{t}"]) - ref).max())
-        assert err < 1e-4, f"token {t}: max|err| = {err:.3e}"
+        assert err < 1e-4, f"layers {L}, token {t}: max|err| = {err:.3e}"
+
+
+def test_group_scaled_i2_fp8_matmul_numeric():
+    """`matmul_i2g` / `matmul_fp8g` match a float reference.
+
+    Only the row-scaled variants (`_s`) existed, so a real 2-bit or FP8
+    checkpoint -- which ships per-group scales like `matmul_i4g` -- could not
+    be expressed at all.  The group contract is the established one: the
+    scale tensor is `f32[N, K/G]` and the group count must divide K.
+    """
+    from veloce import weights as vw
+
+    M, K, N, G = 3, 64, 8, 16
+    rng = np.random.default_rng(7)
+    x = (rng.standard_normal((M, K)) * 0.5).astype(np.float32)
+    sc = (rng.standard_normal((N, K // G)) * 0.5).astype(np.float32)
+
+    # --- matmul_i2g: 4 signed 2-bit values per byte, range [-2, 1]
+    w2 = rng.integers(-2, 2, size=(N, K)).astype(np.int8)
+    packed2 = vw.pack_i2(w2)
+    src = f"""module t2g
+dim M = {M}
+dim K = {K}
+dim N = {N}
+dim NG = {K // G}
+fn f(x: f32[M, K], w: i2[N, K], s: f32[N, NG]) -> f32[M, N] {{
+    return matmul_i2g(x, w, s)
+}}
+"""
+    driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+float *veloce_f(float*, uint8_t*, float*);
+int main(void) {{
+    float x[{M*K}] = {{ {", ".join(cf(v) for v in x.flatten())} }};
+    uint8_t w[{len(packed2)}] = {{ {", ".join(str(b) for b in packed2)} }};
+    float s[{N*(K//G)}] = {{ {", ".join(cf(v) for v in sc.flatten())} }};
+    float *o = veloce_f(x, w, s);
+    for (int i = 0; i < {M*N}; i++) printf("%a\\n", o[i]);
+    return 0;
+}}
+"""
+    rc, out, err, _ = util.build_and_run(src, driver, name="i2g")
+    assert rc == 0, err
+    got = np.array([float.fromhex(v) for v in out.split()],
+                   dtype=np.float64).reshape(M, N)
+    ref = np.zeros((M, N))
+    for n in range(N):
+        for g in range(K // G):
+            ref[:, n] += (x[:, g*G:(g+1)*G].astype(np.float64)
+                          @ w2[n, g*G:(g+1)*G].astype(np.float64)) * sc[n, g]
+    assert np.abs(got - ref).max() < 1e-4, (got, ref)
+
+    # --- matmul_fp8g: E4M3 weights, one byte per value
+    w8 = np.frombuffer(vw.pack_fp8(rng.standard_normal((N, K)) * 0.4),
+                       dtype=np.uint8).reshape(N, K)
+    src8 = f"""module t8g
+dim M = {M}
+dim K = {K}
+dim N = {N}
+dim NG = {K // G}
+fn f(x: f32[M, K], w: fp8[N, K], s: f32[N, NG]) -> f32[M, N] {{
+    return matmul_fp8g(x, w, s)
+}}
+"""
+    driver8 = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+float *veloce_f(float*, uint8_t*, float*);
+int main(void) {{
+    float x[{M*K}] = {{ {", ".join(cf(v) for v in x.flatten())} }};
+    uint8_t w[{N*K}] = {{ {", ".join(str(int(b)) for b in w8.flatten())} }};
+    float s[{N*(K//G)}] = {{ {", ".join(cf(v) for v in sc.flatten())} }};
+    float *o = veloce_f(x, w, s);
+    for (int i = 0; i < {M*N}; i++) printf("%a\\n", o[i]);
+    return 0;
+}}
+"""
+    rc, out, err, _ = util.build_and_run(src8, driver8, name="fp8g")
+    assert rc == 0, err
+    got8 = np.array([float.fromhex(v) for v in out.split()],
+                    dtype=np.float64).reshape(M, N)
+    # The reference must decode the *same* E4M3 bytes the kernel reads, so a
+    # rounding difference in the packer cannot mask a kernel bug.
+    dec = np.array(vw.unpack_fp8(w8.flatten(), N * K),
+                   dtype=np.float64).reshape(N, K)
+    ref8 = np.zeros((M, N))
+    for n in range(N):
+        for g in range(K // G):
+            ref8[:, n] += (x[:, g*G:(g+1)*G].astype(np.float64)
+                           @ dec[n, g*G:(g+1)*G]) * sc[n, g]
+    assert np.abs(got8 - ref8).max() < 1e-4, (got8, ref8)
+
+
+def test_group_scaled_rejects_ragged_group_count():
+    """A group count that does not divide K is rejected for i2/fp8 too.
+
+    `matmul_i4g` had exactly this bug (floor vs ceil group count, 35.8 error
+    for K=100 over 7 groups).  The check is shared now, so the new kernels
+    must reject the same shape at compile time instead of scaling rows
+    against the wrong slices.
+    """
+    import veloce
+    for name, dtype in (("matmul_i2g", "i2"), ("matmul_fp8g", "fp8")):
+        src = f"""module t
+dim M = 2
+dim K = 100
+dim N = 4
+dim NG = 7
+fn f(x: f32[M, K], w: {dtype}[N, K], s: f32[N, NG]) -> f32[M, N] {{
+    return {name}(x, w, s)
+}}
+"""
+        try:
+            veloce.compile_source(src)
+        except (veloce.TypeError_, veloce.SemanticError) as e:
+            assert "divide K exactly" in str(e), e
+        else:
+            raise AssertionError(f"{name} accepted K=100 over 7 groups")
 
 
 def _rmsnorm64(x, w):
