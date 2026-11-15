@@ -871,7 +871,13 @@ static inline float veloce_trit_dot_avx2(const float *x, const uint8_t *w,
     size_t full = (K - q) / 5;          /* whole bytes left */
     size_t bi = e / 5;                  /* byte index of first whole byte */
     size_t b = 0;
-    for (; b + 4 <= full; b += 4, bi += 4, q += 20, e += 20) {
+    /* A four-byte block loads 8 floats at q+15, i.e. it touches x[..q+22],
+     * so it may only run while 23 elements remain.  Without the bound the
+     * last block reads up to three floats past x[K-1]: out of bounds on the
+     * caller's buffer, and 0.0f * a signalling pattern can yield NaN. The
+     * leftover bytes fall through to the scalar loops below, which read
+     * exactly the elements they consume. */
+    for (; b + 4 <= full && q + 23 <= K; b += 4, bi += 4, q += 20, e += 20) {
         const float *v0 = VELOCE_TRIT_LUT_F32[w[bi]];
         const float *v1 = VELOCE_TRIT_LUT_F32[w[bi + 1]];
         const float *v2 = VELOCE_TRIT_LUT_F32[w[bi + 2]];
@@ -1010,7 +1016,9 @@ static inline float veloce_i4_dot_avx2(const float *x, const uint8_t *w,
     size_t full = (K - q) / 2;          /* whole bytes left */
     size_t bi = e / 2;
     size_t b = 0;
-    for (; b + 8 <= full; b += 8, bi += 8, q += 16, e += 16) {
+    /* Eight bytes cover 16 elements but load 8 floats at q+14, touching
+     * x[..q+21]: require 22 elements left so the block stays in bounds. */
+    for (; b + 8 <= full && q + 22 <= K; b += 8, bi += 8, q += 16, e += 16) {
         const float *v0 = VELOCE_I4_LUT[w[bi]];
         const float *v1 = VELOCE_I4_LUT[w[bi + 1]];
         const float *v2 = VELOCE_I4_LUT[w[bi + 2]];
@@ -1223,7 +1231,9 @@ static inline float veloce_i2_dot_avx2(const float *x, const uint8_t *w,
     }
     size_t full = (K - q) / 4;
     size_t bi = e / 4, b = 0;
-    for (; b + 4 <= full; b += 4, bi += 4, q += 16, e += 16) {
+    /* Four bytes cover 16 elements but load 8 floats at q+12, touching
+     * x[..q+19]: require 20 elements left so the block stays in bounds. */
+    for (; b + 4 <= full && q + 20 <= K; b += 4, bi += 4, q += 16, e += 16) {
         const float *v0 = VELOCE_I2_LUT[w[bi]];
         const float *v1 = VELOCE_I2_LUT[w[bi + 1]];
         const float *v2 = VELOCE_I2_LUT[w[bi + 2]];
