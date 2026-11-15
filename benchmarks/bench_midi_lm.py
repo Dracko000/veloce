@@ -47,8 +47,9 @@ sys.path.insert(0, ROOT)
 import veloce  # noqa: E402
 from veloce import weights as vw  # noqa: E402
 from veloce.codegen import ctype_of  # noqa: E402
-from veloce.lmmodule import (DEFAULT_CONFIG, attn_scale,  # noqa: E402
-                             decoder_module, normalize_config)
+from veloce.lmmodule import (DEFAULT_CONFIG, MASK_HIDDEN, attn_scale,  # noqa: E402
+                             cache_buffers, cached_module, decoder_module,
+                             normalize_config)
 
 CC = os.environ.get("CC", "cc")
 RUNTIME = os.path.join(ROOT, "runtime")
@@ -181,11 +182,11 @@ def write_offsets_header(man, path):
         f.write("\n".join(lines) + "\n")
 
 
-def extern_decl(module):
-    """C prototype for the module's `forward`, derived from the parsed AST."""
-    fn = next(f for f in module.functions if f.name == "forward")
+def extern_decl(module, fname="forward"):
+    """C prototype for the module's `fname`, derived from the parsed AST."""
+    fn = next(f for f in module.functions if f.name == fname)
     params = ", ".join(f"{ctype_of(p.type)} {p.cname}" for p in fn.params)
-    return f"{ctype_of(fn.ret_types[0])} veloce_forward({params});"
+    return f"{ctype_of(fn.ret_types[0])} veloce_{fname}({params});"
 
 
 def call_args(module):
@@ -367,6 +368,235 @@ def build_and_run(module, c_source, man, cfg, wpath, iters, dump, extra_flags,
     return runs, exe
 
 
+CACHED_DRIVER_TEMPLATE = r"""
+#define _GNU_SOURCE
+#include "veloce_runtime.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
+#include "midi_lm_offsets.h"
+
+__EXTERN__
+
+static double now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+}
+
+static uint64_t fnv1a(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+__CACHE_DECLS__
+
+static float mask_buf[__CT__];
+
+static const int toks[__NTOK__] = { __TOKS__ };
+
+int main(int argc, char **argv) {
+    const char *wpath = argc > 1 ? argv[1] : "build/midi_lm.veloce";
+    const char *dump = argc > 2 ? argv[2] : "-";
+    const int V = __V__, CT = __CT__;
+
+    int fd = open(wpath, O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { perror("fstat"); return 1; }
+    uint8_t *base = (uint8_t *)mmap(NULL, (size_t)st.st_size, PROT_READ,
+                                    MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) { perror("mmap"); return 1; }
+
+    /* A visible slot keeps a finite score, so exp() underflows the hidden
+       ones to exactly 0.0f instead of producing inf - inf. */
+    for (int i = 0; i < CT; i++) mask_buf[i] = __MASK_HIDDEN__f;
+
+    float *out = NULL;
+    /* Warmup: two steps at pos 0, which writes the same row twice. */
+    for (int t = 0; t < 2; t++) {
+        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= 0) ? 0.0f : __MASK_HIDDEN__f;
+        out = veloce_forward_cached(
+        __CARGS__);
+    }
+
+    /* Untimed pass for bit-exact determinism of the whole decode. */
+    __CACHE_ZERO__
+    for (int i = 0; i < CT; i++) mask_buf[i] = __MASK_HIDDEN__f;
+    for (int t = 0; t < __NTOK__; t++) {
+        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 0.0f : __MASK_HIDDEN__f;
+        out = veloce_forward_cached(
+        __CARGS__);
+    }
+    float *ref = (float *)malloc((size_t)V * sizeof(float));
+    memcpy(ref, out, (size_t)V * sizeof(float));
+
+    __CACHE_ZERO__
+    for (int i = 0; i < CT; i++) mask_buf[i] = __MASK_HIDDEN__f;
+    double t0 = now_ns();
+    for (int t = 0; t < __NTOK__; t++) {
+        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 0.0f : __MASK_HIDDEN__f;
+        out = veloce_forward_cached(
+        __CARGS__);
+    }
+    double t1 = now_ns();
+    int det = memcmp(ref, out, (size_t)V * sizeof(float)) == 0;
+
+    int nonfinite = 0, argmax = 0;
+    double sum = 0.0;
+    for (int i = 0; i < V; i++) {
+        unsigned bits;
+        memcpy(&bits, &out[i], 4);
+        if ((bits & 0x7f800000u) == 0x7f800000u) nonfinite++;
+        sum += (double)out[i];
+        if (out[i] > out[argmax]) argmax = i;
+    }
+    if (strcmp(dump, "-") != 0) {
+        FILE *f = fopen(dump, "wb");
+        if (f) { fwrite(out, sizeof(float), (size_t)V, f); fclose(f); }
+    }
+
+    printf("CACHED threads=%s tokens=%d ms=%.4f per_token_ms=%.4f tok_s=%.2f "
+           "hash=%016llx det=%d argmax=%d sum=%.6f nonfinite=%d\n",
+           getenv("VELOCE_THREADS") ? getenv("VELOCE_THREADS") : "auto",
+           __NTOK__, (t1 - t0) / 1e6, (t1 - t0) / 1e6 / __NTOK__,
+           __NTOK__ * 1e9 / (t1 - t0),
+           (unsigned long long)fnv1a(out, (size_t)V * sizeof(float)),
+           det, argmax, sum, nonfinite);
+    return det && nonfinite == 0 ? 0 : 2;
+}
+"""
+
+
+def cached_artefacts(module, cfg, ct):
+    """(C decls for the KV caches, arg list, zero-fill statement)."""
+    bufs = cache_buffers(cfg, ct)
+    decls = "\n".join(f"static float {n}[{ct * cfg['D']}] "
+                      f"__attribute__((aligned(64)));" for n, _, _ in bufs)
+    zero = "\n    ".join(f"memset({n}, 0, sizeof({n}));" for n, _, _ in bufs)
+    host = {n for n, _, _ in bufs} | {"mask"}
+
+    fn = next(f for f in module.functions if f.name == "forward_cached")
+    args = []
+    for p in fn.params:
+        if p.name in host:
+            args.append("mask_buf" if p.name == "mask" else p.name)
+        elif isinstance(p.type, veloce.ast_mod.TensorType):
+            args.append(f"({ctype_of(p.type)})(base + OFF_{p.name})")
+        elif p.name == "tok":
+            args.append("toks[t]")
+        elif p.name == "pos":
+            args.append("t")
+        else:
+            raise SystemExit(f"unexpected forward_cached parameter {p.name!r}")
+    return decls, ",\n        ".join(args), zero
+
+
+def build_and_run_cached(man, cfg, wpath, ct, ntok, dump, workdir):
+    """Build and time the cached decoder: N tokens through a real KV cache."""
+    import random
+    rnd = random.Random(1234)
+    toks = [rnd.randrange(cfg["V"]) for _ in range(ntok)]
+
+    src = cached_module(cfg, ct)
+    vel_path = os.path.join(workdir, cfg["name"] + "_cached.vel")
+    with open(vel_path, "w") as f:
+        f.write(src)
+    res = veloce.compile_file(vel_path)
+
+    os.makedirs(workdir, exist_ok=True)
+    hdr = os.path.join(workdir, "midi_lm_offsets.h")
+    write_offsets_header(man, hdr)
+    gen_c = os.path.join(workdir, "midi_lm_cached.c")
+    with open(gen_c, "w") as f:
+        f.write(res.c_source)
+
+    decls, cargs, zero = cached_artefacts(res.module, cfg, ct)
+    drv_src = (CACHED_DRIVER_TEMPLATE
+               .replace("__EXTERN__", extern_decl(res.module, "forward_cached"))
+               .replace("__CACHE_DECLS__", decls)
+               .replace("__CACHE_ZERO__", zero)
+               .replace("__CARGS__", cargs)
+               .replace("__MASK_HIDDEN__", repr(float(MASK_HIDDEN)))
+               .replace("__CT__", str(ct))
+               .replace("__NTOK__", str(ntok))
+               .replace("__TOKS__", ", ".join(str(t) for t in toks))
+               .replace("__V__", str(cfg["V"])))
+    drv = os.path.join(workdir, "midi_lm_cached_driver.c")
+    with open(drv, "w") as f:
+        f.write(drv_src)
+
+    exe = os.path.join(workdir, "midi_lm_cached")
+    cmd = [CC, *CFLAGS, "-I", RUNTIME, "-I", workdir,
+           drv, gen_c, "-lm", "-o", exe]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit("cached build failed:\n" + r.stderr)
+
+    runs = []
+    for threads in ("1", "2", "3", "4"):
+        env = dict(os.environ, VELOCE_THREADS=threads)
+        r = subprocess.run([exe, wpath, dump], capture_output=True, text=True,
+                           env=env)
+        if r.returncode not in (0, 2):
+            raise SystemExit(f"cached run failed (threads={threads}):\n{r.stderr}")
+        line = next((ln for ln in r.stdout.splitlines()
+                     if ln.startswith("CACHED")), None)
+        if line is None:
+            raise SystemExit(f"no CACHED line:\n{r.stdout}\n{r.stderr}")
+        rec = {"threads": threads}
+        for kv in line.split()[1:]:
+            k, v = kv.split("=", 1)
+            rec[k] = v
+        for k in ("ms", "per_token_ms", "tok_s", "sum"):
+            rec[k] = float(rec[k])
+        for k in ("tokens", "det", "argmax", "nonfinite"):
+            rec[k] = int(rec[k])
+        rec["hash"] = int(rec["hash"], 16)
+        runs.append(rec)
+    return runs, toks, res
+
+
+def reference_cached_logits(vf, toks, cfg, ct):
+    """NumPy reference for the whole cached decode (masked attention)."""
+    V, D, L = cfg["V"], cfg["D"], cfg["layers"]
+    scale = np.float32(attn_scale(cfg))
+    ck = [np.zeros((ct, D)) for _ in range(L)]
+    cv = [np.zeros((ct, D)) for _ in range(L)]
+    head = vf.numpy("head")
+    x = None
+    for t, tok in enumerate(toks):
+        x = vf.numpy("emb")[tok].astype(np.float64)
+        for l in range(1, L + 1):
+            nw = vf.numpy(f"nw{l}").astype(np.float64)
+            xn = _rmsnorm(x, nw, D)
+            k = _tritmm(xn, vf.numpy(f"wk{l}"))
+            v = _tritmm(xn, vf.numpy(f"wv{l}"))
+            q = _tritmm(xn, vf.numpy(f"wq{l}"))
+            ck[l - 1][t] = k
+            cv[l - 1][t] = v
+            scores = (q @ ck[l - 1][:t + 1].T) * scale
+            e = np.exp(scores - scores.max())
+            p = e / e.sum()
+            a = p @ cv[l - 1][:t + 1]
+            o = _tritmm(a, vf.numpy(f"wo{l}"))
+            x = x + o
+            xn2 = _rmsnorm(x, nw, D)
+            g = _tritmm(xn2, vf.numpy(f"w1{l}"))
+            u = _tritmm(xn2, vf.numpy(f"w3{l}"))
+            x = x + _tritmm(_silu(g) * u, vf.numpy(f"w2{l}"))
+    xn = _rmsnorm(x, vf.numpy("nwf").astype(np.float64), D)
+    return _tritmm(xn, head)
+
+
 # ---------------------------------------------------------------------------
 # optional NumPy reference
 # ---------------------------------------------------------------------------
@@ -489,6 +719,12 @@ def main():
                     help="override V/D/F/layers/scale/name (repeatable)")
     ap.add_argument("--prepare-only", action="store_true",
                     help="write module + weights, skip building/running")
+    ap.add_argument("--cached", action="store_true",
+                    help="also decode N tokens through a real KV cache")
+    ap.add_argument("--cache-slots", type=int, default=64,
+                    help="KV-cache length for --cached (default 64)")
+    ap.add_argument("--tokens", type=int, default=32,
+                    help="tokens to decode in --cached mode (default 32)")
     args = ap.parse_args()
 
     cfg = parse_config(args.config)
@@ -597,6 +833,50 @@ def main():
 
     ver = verify(args.weights, dump, cfg) if args.verify else None
 
+    cached = None
+    if args.cached:
+        ct = args.cache_slots
+        if args.tokens > ct:
+            raise SystemExit(f"--tokens {args.tokens} exceeds --cache-slots {ct}")
+        cdump = os.path.join(work, "midi_lm_cached_logits.bin")
+        cruns, toks, cres = build_and_run_cached(man, cfg, args.weights, ct,
+                                                 args.tokens, cdump, work)
+        print()
+        print(f"-- cached decode: {args.tokens} tokens through a "
+              f"{ct}-slot KV cache per layer --")
+        print(f"{'threads':>8} {'total ms':>10} {'ms/token':>10} {'tok/s':>8} "
+              f"{'hash':>18} {'det':>4}")
+        for r in cruns:
+            print(f"{r['threads']:>8} {r['ms']:>10.2f} {r['per_token_ms']:>10.3f} "
+                  f"{r['tok_s']:>8.2f} {r['hash']:016x} {r['det']:>4}")
+        cbest = max(r["tok_s"] for r in cruns)
+        chashes = {r["hash"] for r in cruns}
+        cdet = all(r["det"] == 1 for r in cruns) and len(chashes) == 1
+        cnonfinite = sum(r["nonfinite"] for r in cruns)
+        print(f"cached best      : {cbest:.2f} tok/s "
+              f"({1000.0 / cbest:.2f} ms/token, {args.tokens} tokens)")
+        print(f"cached determinism: {'PASS' if cdet else 'FAIL'} -- "
+              f"{len(chashes)} distinct hash(es), nonfinite={cnonfinite}")
+        cver = None
+        if args.verify:
+            ref = reference_cached_logits(
+                vw.VeloceFile(args.weights), toks, cfg, ct)
+            got = np.fromfile(cdump, dtype=np.float32)
+            cerr = float(np.max(np.abs(got - ref)))
+            cscale = float(np.max(np.abs(ref))) or 1.0
+            cok = (cerr / cscale) < 2e-2
+            print(f"cached verify    : max|veloce-numpy| = {cerr:.3e} "
+                  f"(relative {cerr / cscale:.2e}, logit scale {cscale:.3f})  "
+                  f"{'PASS' if cok else 'FAIL'}")
+            cver = {"abs_err": cerr, "rel_err": cerr / cscale,
+                    "scale": cscale, "pass": bool(cok)}
+        print(f"cached vs eager  : {cbest:.2f} vs {best:.2f} tok/s "
+              f"({cbest / best:.2f}x)")
+        cached = {"slots": ct, "tokens": args.tokens, "runs": cruns,
+                  "best_tok_s": cbest, "deterministic": cdet,
+                  "nonfinite": cnonfinite, "verify": cver,
+                  "speedup_vs_eager": cbest / best}
+
     if args.json:
         payload = {
             "model": cfg,
@@ -612,6 +892,7 @@ def main():
             "host_loadavg_1m": load,
             "deterministic": det_ok,
             "verify": ver,
+            "cached": cached,
         }
         with open(args.json, "w") as f:
             json.dump(payload, f, indent=2)
