@@ -41,60 +41,46 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. BLOCKER: two-layer cached decode diverges (~1e30)
-
-`forward_cached` with `layers >= 2` produces ~1e30 at the second layer; one
-layer is exact. The test is parked as `_quarantine_cached_decode_attention_mask`
-in `tests/test_veloce.py` (renamed, not deleted) so the suite is not red.
-Rename it back once fixed.
-
-Evidence gathered so far (all reproducible):
-
-* `attn_c` alone matches a float64 reference exactly (`veloce_attn_c`,
-  CT=4 D=8, masked slots give probability 0). Correct.
-* `layer_c` alone matches to 1.5e-6, for both layer 1 and layer 2 weights,
-  including when it writes into `static float ck[L][CT*D]`.
-* Two `layer_c` calls in one driver, each on a *copy* of the previous output,
-  still explode at the second call. Both `ck[0]` and `ck[1]` hold the correct
-  key rows afterwards, so the cache is not being corrupted.
-* Instrumenting the generated `forward_cached` shows `x059` (layer-1 result)
-  correct and `x261` (layer-2 result) at ~1e30 — i.e. a masked score reached
-  the visible slot only on the second call.
-* The trit/i4/i2 kernels are exact for every K in {5,8,10,16,32,64,128} and
-  N in {8,16}, so it is not the matmul.
-
-Next thing to try: dump the per-instruction arena state inside `layer_c` when
-it is the *second* invocation (the first is fine), and check whether
-`veloce_parallel_for_sized` + the C11 pool reuses a thread-local scratch that
-the second call inherits. If that is not it, check whether `mask` (`f32[CT]`,
-8 words) is being read with the `[CT]` stride the reference assumes.
-
-### 2. KV cache in the real benchmark (cached path exists, needs the fix above)
-
-`benchmarks/bench_midi_lm.py` grew a `--config`/`--model-dir`/`--prepare-only`
-surface and a cached decode path. A cached run reported 31.49 tok/s for 32
-tokens with determinism PASS and rel err 1.2e-6, but it cannot be trusted as a
-reference number until item 1 is fixed and the parked test passes.
-
-### 3. `matmul_i2` / `matmul_fp8` group-scaled variants
-
-Only row-scaled (`_s`) exist. Real 2-bit and FP8 checkpoints ship per-group
-scales (`matmul_i2g`, `matmul_fp8g`), like `matmul_i4g`. The group-size
-contract is already established: the group count must divide K exactly.
-
-### 4. Attention masking as a first-class builtin
+### 1. Attention masking as a first-class builtin
 
 Masking currently works by adding a `f32[CT]` bias of `-1e30` to the scores
 (`veloce.lmmodule.MASK_HIDDEN`). That is a convention, not a language feature;
 a `mask` argument on `softmax` would be safer than relying on `-1e30` not
 overflowing.
 
-### 5. Stale benchmark artefacts
+### 2. Stale benchmark artefacts
 
 `benchmarks/results.json` holds numbers from an older host state; re-run
 `make bench` and commit the fresh file, or state the date in the file.
 
 ## Done (most recent first)
+
+* **The "two-layer cached decode diverges at ~1e30" blocker was not a compiler
+  bug.** The parked test's C driver built the `forward_cached` argument list by
+  hand -- every KV cache first, then every weight -- while the generated
+  signature interleaves them per layer (`ck1, cv1, nw1, wq1, ..., ck2, ...`).
+  For `L == 1` both orders coincide, which is exactly why one layer looked
+  exact and two layers exploded: every argument past `cv1` was shifted by two,
+  so layer 2 read layer 1's weights and a `f32[D]` array as a trit matrix.
+  `test_cached_decode_attention_mask` is un-parked (no other quarantine
+  added), builds its argument list from the parsed signature, and runs 1, 2 and
+  3 layers. Runtime suite 28 -> 31 tests, compiler suite 37 -> 40.
+  Real measurement at the default 275M-trit shape (`--cached --cache-slots 64
+  --tokens 32 --verify`): 22.34 tok/s, 44.76 ms/token, determinism PASS (one
+  distinct logit hash), `max|veloce-numpy| = 1.458e-04` (relative 1.16e-06)
+  PASS, 0.75x the eager path.
+
+* **`matmul_i2g` / `matmul_fp8g` group-scaled variants** (real 2-bit and FP8
+  checkpoints ship per-group scales). Both reuse the established contract --
+  `f32[N, K/G]`, group count must divide K -- through a single typechecker
+  rule (`_group_scaled_matmul`) and a single lowering path shared with
+  `matmul_i4g`. Runtime: `veloce_i2_dot_scaled` / `veloce_fp8_dot_scaled` plus
+  gemv/mat row kernels. Numeric test against a float64 reference
+  (`test_group_scaled_i2_fp8_matmul_numeric`), ragged-group rejection for all
+  three kernels, and codegen assertions on the derived group size.
+  Also fixed a real defect the new test exposed: `weights.unpack_fp8` did
+  `exp - 7` on a NumPy `uint8`, which wrapped to 249 and decoded every byte to
+  ~1e77 instead of a finite value.
 
 * `bench_midi_lm.py` now generates its decoder module from a shape config
   (`--config KEY=VAL`, `--model-dir`, `--prepare-only`) via the new

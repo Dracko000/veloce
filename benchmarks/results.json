@@ -1,4 +1,5 @@
 {
+  "measured_at": "2026-11-15T21:27:57Z",
   "machine": {
     "cpu": "AMD EPYC Processor (with IBPB)",
     "cores": 4,
@@ -13,36 +14,36 @@
     "memory_reduction": 0.8
   },
   "trit_gemv": {
-    "T1_MS": 2.2578,
-    "T2_MS": 1.2348,
-    "T4_MS": 1.7398,
-    "T1_GMAC": 7.431,
-    "T2_GMAC": 13.587,
-    "T4_GMAC": 9.643,
+    "T1_MS": 2.2959,
+    "T2_MS": 1.3286,
+    "T4_MS": 1.0492,
+    "T1_GMAC": 7.308,
+    "T2_GMAC": 12.628,
+    "T4_GMAC": 15.99,
     "THREADS": 4.0
   },
-  "trit_gemv_speedup": 1.2976719149508815,
+  "trit_gemv_speedup": 2.1880131362889985,
   "attention": {
-    "BEST_MS": 52.314,
-    "FLOPS": 20.525
+    "BEST_MS": 35.6219,
+    "FLOPS": 30.143
   },
-  "membw_gbps": 3.803,
+  "membw_gbps": 3.742,
   "compiled_layer": {
-    "BEST_MS": 19.8917,
-    "GMAC": 10.174,
+    "BEST_MS": 10.0475,
+    "GMAC": 20.142,
     "OUT": -364066.0,
     "macs_per_layer": 202375168.0
   },
-  "compiled_layer_tokens_per_sec": 1.571007002920816,
+  "compiled_layer_tokens_per_sec": 3.110226424483703,
   "projection": {
-    "tokens_per_sec": 1.489064016053301,
-    "ms_per_token": 671.5628000000002,
-    "gemv_gmacs": 9.643186573169329,
+    "tokens_per_sec": 2.4691894539930743,
+    "ms_per_token": 404.9912,
+    "gemv_gmacs": 15.990484178421656,
     "macs_per_token": 6476005376,
-    "gap_x": 10.073442000000002,
-    "roofline_tokens_per_sec": 2.877974468570837,
-    "achieved_gbps": 1.9286373146338658,
-    "peak_gbps": 3.803
+    "gap_x": 6.074868,
+    "roofline_tokens_per_sec": 2.8318118489066717,
+    "achieved_gbps": 3.1980968356843316,
+    "peak_gbps": 3.742
   },
   "memory": {
     "params": 6607077376,
@@ -53,14 +54,14 @@
     "vs_f32_pct": 95.0
   },
   "compile": {
-    "seconds": 0.003017271403223276,
+    "seconds": 0.0030102157033979893,
     "heap_calls": []
   },
   "summary": [
     {
       "requirement": "FR-4.2 parallel speedup > 1",
       "pass": true,
-      "measured": "1.30x on 4 cores"
+      "measured": "2.19x on 4 cores"
     },
     {
       "requirement": "Memory >=80% smaller than fp16",
@@ -80,7 +81,7 @@
     {
       "requirement": "Speed >= 15 tok/s (7B-class)",
       "pass": false,
-      "measured": "1.49 tok/s projected / 1.57 compiled (HW ceiling 2.88)"
+      "measured": "2.47 tok/s projected / 3.11 compiled (HW ceiling 2.83)"
     }
   ]
 }

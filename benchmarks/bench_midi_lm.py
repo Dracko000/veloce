@@ -879,6 +879,9 @@ def main():
 
     if args.json:
         payload = {
+            # These numbers only mean something for the host state they were
+            # measured on; an undated file invites stale comparisons.
+            "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "model": cfg,
             "params": counts,
             "file_bytes": file_bytes,

@@ -107,6 +107,7 @@ kernels. Representative result:
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
 | **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **20–22 tok/s** (1 thread, 45–50 ms median; 25–26 tok/s best-of-21) | — |
 | same model, 2 threads | 28–36 tok/s (28–36 ms median; host-load dependent) | — |
+| same model, **KV-cached** decode (32 tokens, 64 slots/layer) | **22.3 tok/s** (44.8 ms/token, 0.75× eager, verify rel err 1.2e-6) | — |
 | projected 7B-class decode | **~2.4–3.0 tok/s** (compiled layer: 3.3–4.3 tok/s) | ≥ 15 tok/s (**5–6× short**) |
 | weight footprint (7B-class) | 1.3 GB vs 13.2 GB fp16 (90% saved) | ≥ 80% smaller ✅ |
 | compile time | ~4 ms | < 2 s ✅ |
@@ -133,7 +134,9 @@ shared VM (load average ~2.7 on 4 vCPUs); 2 threads help, 4 usually hurt.
 The VM is shared, so numbers vary run to run; every benchmark reports medians
 and best-of-N, plus a same-run streaming-bandwidth probe so a tok/s figure can
 be read against what the host can actually deliver. `benchmarks/results.json`
-and `benchmarks/midi_lm_results.json` hold the last full runs.
+and `benchmarks/midi_lm_results.json` hold the last full runs; both are
+stamped with `measured_at` (UTC) and the CPU they were taken on, because a
+figure is only comparable against the host state that produced it.
 
 ## Serving & export scope
 
@@ -202,8 +205,8 @@ examples/               hello.vel, transformer_block.vel, tiny_lm.vel, midi_lm.v
 demo/tiny_lm.c          runnable inference demo driver
 benchmarks/bench_throughput.py  real throughput vs PRD targets (GMAC/s, tok/s, roofline)
 benchmarks/bench_midi_lm.py     end-to-end 275.6M ternary decoder (--config for other shapes)
-tests/test_veloce.py    end-to-end test-suite (28 tests, incl. FR-4.2)
-tests/test_compiler.py  front-end / codegen / packing / model-card suite (37 tests)
+tests/test_veloce.py    end-to-end test-suite (31 tests, incl. FR-4.2)
+tests/test_compiler.py  front-end / codegen / packing / model-card suite (40 tests)
 requirements-test.txt   NumPy pin for the auto-created .venv
 ```
 

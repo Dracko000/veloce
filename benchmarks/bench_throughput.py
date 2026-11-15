@@ -20,6 +20,7 @@ Usage:
 No numpy is required: the benchmark uses the runtime directly from C.
 """
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -427,6 +428,11 @@ def main():
     omp = have_openmp()
     pool_flags = ["-fopenmp"] if omp else []
     report = {
+        # Stamp the run: these numbers are only meaningful for the host state
+        # they were measured on, and an undated file invites comparing a fresh
+        # figure against a stale one.
+        "measured_at": datetime.datetime.now(datetime.timezone.utc)
+                               .strftime("%Y-%m-%dT%H:%M:%SZ"),
         "machine": {"cpu": cpu_model(), "cores": nproc(), "cc": CC,
                     "openmp": omp, "python": platform.python_version()},
         "prd": {"tokens_per_sec": PRD_TOKENS_PER_SEC, "model": PRD_MODEL,
