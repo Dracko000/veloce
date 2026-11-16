@@ -126,10 +126,11 @@ kernels. Representative result:
 
 | Metric | Measured | PRD target |
 |--------|----------|------------|
-| trit GEMV 4096×4096 (1 thread → 4 threads) | 7.6 → 15.5–19.4 GMAC/s (**2.1–2.5× speedup**) | — |
-| trit GEMV read bandwidth | 3.6 GB/s = **19% of the host's 18.7 GB/s peak** (decode-bound, see below) | — |
+| trit GEMV 4096×4096 (1 thread → 4 threads) | 8.8–9.3 → 19.7–23.0 GMAC/s (**2.2–2.5× speedup**) | — |
+| trit GEMV read bandwidth | 3.9–4.6 GB/s = **22–31% of peak** (decode-bound, see below) | — |
+| trit GEMV, four rows per pass vs one neuron at a time | **1.30–1.34×** median of 3 runs (K = 1024, 1536, 4096) | — |
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
-| **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **20–22 tok/s** (1 thread, 45–50 ms median; 25–26 tok/s best-of-21) | — |
+| **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **23.6 tok/s** (1 thread, 42.3 ms median; 25.9 tok/s best) | — |
 | same model, 2 threads | 28–36 tok/s (28–36 ms median; host-load dependent) | — |
 | same model, **KV-cached** decode (32 tokens, 64 slots/layer) | **22.3 tok/s** (44.8 ms/token, 0.75× eager, verify rel err 1.2e-6) | — |
 | projected 7B-class decode | **~2.4–3.0 tok/s** (compiled layer: 3.3–4.3 tok/s) | ≥ 15 tok/s (**5–6× short**) |
@@ -140,15 +141,26 @@ kernels. Representative result:
 The 7B-class speed gap is NOT purely memory bandwidth, and the earlier claim
 that the kernel sat at the bandwidth roofline was measurement error. The old
 "streaming peak" was a scalar single-threaded byte-sum loop; the real ceiling
-this VM can stream is **18.7 GB/s at 4 threads** (5.4 GB/s at 1). Against
-that, the trit GEMV achieves **3.6 GB/s — 19% of peak**, so it is *decode*
-bound, not bandwidth bound: every packed byte needs an 8-float LUT load plus
-an 8-float `x` load for only 5 useful values, so it leaves well over half the
-load throughput on the floor. `benchmarks/bench_gemv_roofline.py` measures
-this directly (a dense f32 FMA runs ~2x the GEMV's MAC rate while reading 4x
-the bytes). Closing that gap is real optimization headroom, not a hardware
-wall; the ~14 tok/s roofline printed above is only reachable once the decode
-stops being the bottleneck.
+this VM can stream is **12.6–20.8 GB/s at 4 threads** (5.7 GB/s at 1, both
+host-load dependent). Against that the trit GEMV achieves **3.9–4.6 GB/s —
+22–31% of peak**, so it is *decode* bound, not bandwidth bound: every packed
+byte needs a byte load plus a 32-byte LUT load for only 5 useful values.
+
+The kernel now works on four output rows per pass. Flat base-3 packing puts
+row j at byte `(j*K)/5` slot `(j*K)%5`, so rows only share an `x` window when
+they are in the same byte phase; the kernel runs rows `j, j+p, j+2p, j+3p`
+(`p = 5/gcd(K,5)`) and feeds one pair of 32-byte `x` loads to four LUT loads
+and four FMAs instead of re-reading `x` for every output neuron. Same-process
+back-to-back measurement puts that at **1.30–1.34×** (median of 3 runs at
+K = 1024/1536/4096), and end to end at 23.6 tok/s versus 22.3. What remains is
+one byte load plus one 32-byte table load per five MACs — about three load
+slots per five MACs on this EPYC, whose 128-bit FP units split 32-byte loads in
+two — so ~3.3 MAC/cycle is the current wall.
+`benchmarks/bench_gemv_roofline.py` measures all of this directly (a dense f32
+FMA runs 1.5–2× the GEMV's MAC rate while reading 4× the bytes). Closing the
+rest is real optimization headroom, not a hardware wall; the 9.5–15.8 tok/s
+roofline printed above is only reachable once the decode stops being the
+bottleneck.
 
 The mid-size number is a *real* end-to-end run, not a projection:
 `benchmarks/bench_midi_lm.py` generates a 275.6M-ternary-parameter decoder with
@@ -157,9 +169,9 @@ deterministic weights, writes it as a `.veloce` file, renders the module with
 keeps in sync), compiles it and times the generated C against the mmap'd file.
 `--config D=2048 --config F=5632 --config layers=7` measures a second,
 0.5B-shaped network from the same command; `make bench-midi-05b` does it. On
-one thread the model sustains ~7 GMAC/s — the same rate as the standalone
+one thread the model sustains ~7.4 GMAC/s — the same rate as the standalone
 kernel — so it runs at the kernel's compute roofline, and streams 55 MB of
-packed trits per token at ~1.2 GB/s. Multi-thread scaling is limited by this
+packed trits per token at ~1.30 GB/s. Multi-thread scaling is limited by this
 shared VM (load average ~2.7 on 4 vCPUs); 2 threads help, 4 usually hurt.
 
 The VM is shared, so numbers vary run to run; every benchmark reports medians

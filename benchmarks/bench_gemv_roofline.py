@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Where does the trit GEMV actually spend its time?
 
-The implementation notes used to claim the kernel sits at the memory roofline.
-This benchmark tests that claim three ways on the *same* packed bytes:
+The implementation notes used to claim the kernel sat at the memory roofline.
+This benchmark tests that claim four ways on the *same* packed bytes:
 
     probe   pure streaming read of the packed weights (no decode, no FLOPs)
     ceiling an 8-wide f32 FMA over dense weights -- the best a dot product
             can do on this machine when decoding is free
-    kernel  the shipped trit GEMV
+    scalar  one output neuron at a time (veloce_trit_dot per row)
+    gemv    the shipped kernel: four output neurons per pass, sharing the x
+            loads (veloce_matmul_trit with M == 1)
+
+All four run at VELOCE_POOL=0, i.e. one thread, because the probe and the
+ceiling are single-threaded and comparing them to a four-thread kernel is how
+the old "99% of streaming peak" claim was manufactured.
 
 Run it and read the ratios:
 
     python3 benchmarks/bench_gemv_roofline.py
 
-If `kernel` is close to `probe`, the kernel is bandwidth bound and nothing can
-be won in the kernel.  If `kernel` is far below `ceiling`, it is limited by the
+If `gemv` is close to `probe`, the kernel is bandwidth bound and nothing can be
+won in the kernel.  If `gemv` is far below `ceiling`, it is limited by the
 decode (load ports and wasted lanes), and there is headroom.
 """
 import os
@@ -83,6 +89,7 @@ int main(int argc, char **argv) {
 
     float *x = malloc(K * sizeof(float));
     float *wf = malloc(K * sizeof(float));
+    float *out = malloc(N * sizeof(float));
     uint8_t *w = malloc(nbytes);
     for (size_t i = 0; i < K; i++) {
         x[i] = (float)((int)(i % 17) - 8) * 0.031f;
@@ -105,20 +112,30 @@ int main(int argc, char **argv) {
 
     t0 = now_s();
     for (int r = 0; r < reps; r++)
-        for (size_t j = 0; j < N; j++) sink += veloce_trit_dot(x, w, j * K, K);
+        for (size_t j = 0; j < N; j++)
+            sink += veloce_trit_dot(x, w, j * K, K);
+    double ts = (now_s() - t0) / reps;
+
+    t0 = now_s();
+    for (int r = 0; r < reps; r++) {
+        veloce_matmul_trit(out, x, w, 1, K, N);
+        sink += out[0];
+    }
     double tk = (now_s() - t0) / reps;
 
     double macs = (double)N * K;
     double mb = nbytes / 1e6;
     printf("K=%zu N=%zu  packed weights %.2f MB\n", K, N, mb);
-    printf("  probe (read only)  : %8.3f ms  %7.2f GB/s\n", tp * 1e3, mb / 1e3 / tp);
-    printf("  ceiling (dense FMA): %8.3f ms  %7.2f GMAC/s  %7.2f GB/s\n",
+    printf("  probe (read only)   : %8.3f ms  %7.2f GB/s\n", tp * 1e3, mb / 1e3 / tp);
+    printf("  ceiling (dense FMA) : %8.3f ms  %7.2f GMAC/s  %7.2f GB/s\n",
            tc * 1e3, macs / 1e9 / tc, (double)N * K * 4 / 1e9 / tc);
-    printf("  kernel (trit GEMV) : %8.3f ms  %7.2f GMAC/s  %7.2f GB/s\n",
+    printf("  scalar (1 neuron)   : %8.3f ms  %7.2f GMAC/s\n", ts * 1e3, macs / 1e9 / ts);
+    printf("  gemv  (4 neurons)   : %8.3f ms  %7.2f GMAC/s  %7.2f GB/s\n",
            tk * 1e3, macs / 1e9 / tk, mb / 1e3 / tk);
-    printf("  kernel / ceiling   : %6.2fx   (>1 means the decode costs more than it saves)\n",
+    printf("  gemv / scalar       : %6.2fx\n", ts / tk);
+    printf("  gemv / ceiling      : %6.2fx   (>1 means the decode costs more than it saves)\n",
            tc / tk);
-    printf("  kernel vs probe    : %6.2fx slower than a pure read of the same bytes\n",
+    printf("  gemv vs probe       : %6.2fx slower than a pure read of the same bytes\n",
            tk / tp);
     (void)sink; (void)usink;
     return 0;
@@ -134,7 +151,7 @@ def main():
         with open(src, "w") as f:
             f.write(C_SRC)
         flags = ["-std=c11", "-O3", "-march=native", "-ffast-math", "-pthread",
-                 "-I", RUNTIME]
+                 "-DVELOCE_POOL=0", "-I", RUNTIME]
         r = subprocess.run([CC, *flags, src, "-lm", "-o", exe],
                            capture_output=True, text=True)
         if r.returncode != 0:

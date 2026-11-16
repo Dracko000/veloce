@@ -751,6 +751,52 @@ def test_parallel_trit_bit_exact():
         assert len(set(outs)) == 1, outs
 
 
+def test_trit_gemv_phase_grouped_rows():
+    """The four-row GEMV groups rows that share a byte *phase*: with the flat
+    packing row j starts at slot (j*K)%5, so the kernel runs rows
+    j, j+p, j+2p, j+3p (p = 5/gcd(K,5)) and lets them share one x load.
+
+    K % 5 != 0 makes p == 5, and N is a whole number of tiles, so every output
+    neuron goes through that grouped path: a kernel that assumed adjacent rows
+    -- or that mis-indexed the phase stride -- decodes another row's weights and
+    the reference check below fails.  The second assertion pins the batched
+    (M == 2) row path to exactly the same arithmetic as the GEMV path, which is
+    what makes the two paths interchangeable for a decode loop.
+    """
+    K, N = 1003, 20                     # period 5, 1 tile of 20 rows
+    rng = np.random.default_rng(4242)
+    x = rng.standard_normal((1, K)).astype(np.float32)
+    W = rng.integers(-1, 2, size=(N, K)).astype(np.int8)
+    expected = (x @ W.astype(np.float32).T).flatten()
+
+    xl = ", ".join(cf(v) for v in x.flatten())
+    wl = ", ".join(str(int(v)) for v in W.flatten())
+    driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+int main(void) {{
+    float x[2 * {K}] = {{ {xl}, {xl} }};
+    int8_t w[{N*K}] = {{ {wl} }};
+    uint8_t packed[{(N*K+4)//5}];
+    veloce_pack_trits(packed, w, {N*K});
+    float g[{N}], b[2 * {N}];
+    veloce_matmul_trit(g, x, packed, 1, {K}, {N});
+    veloce_matmul_trit(b, x, packed, 2, {K}, {N});
+    int same = 1;
+    for (int j = 0; j < {N}; j++)
+        if (b[j] != g[j] || b[{N} + j] != g[j]) same = 0;
+    printf("batched_matches_gemv %s\\n", same ? "PASS" : "FAIL");
+    {check_close('g', list(expected), N, tol=1e-4, tag='phase_gemv')}
+    return same ? 0 : 1;
+}}
+"""
+    rc, out, err, _ = util.build_and_run(
+        "module t\ndim A=1\nfn f(x: f32[A]) -> f32[A] { return x }\n", driver)
+    assert rc == 0, (rc, err, out)
+    assert "batched_matches_gemv PASS" in out, out
+    assert "phase_gemv maxerr" in out and "PASS" in out.split("phase_gemv")[1], out
+
+
 def test_parallel_matches_serial_transformer():
     """FR-4.2: the full transformer layer is deterministic under 4 threads."""
     root = os.path.dirname(HERE)

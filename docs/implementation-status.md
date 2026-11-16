@@ -92,22 +92,35 @@ real module (see `test_erd_introspection`).
   launch overhead. `VELOCE_POOL=0` forces a serial build; `VELOCE_THREADS=n`
   pins the worker count, `VELOCE_PAR_MIN` (default 1024 output elements) sets
   the smallest problem that is worth a fork-join.
-* **Measured performance (4-vCPU shared VM, load average ~2.7)**: the AVX2
-  trit GEMV decodes 5 trits per byte with a 256-entry float LUT and 4
-  independent accumulators, reaching ~7.6 GMAC/s on one thread and 15.5–19.4
-  GMAC/s on four (2.1–2.5×), i.e. ~3.6 GB/s of packed weights. **This is 19%
-  of the host's real streaming peak (18.7 GB/s at 4 threads, 5.4 at 1), not
-  the 81–97% an earlier revision claimed** — that figure compared a
-  single-threaded scalar probe against a four-thread SIMD kernel. The kernel
-  is therefore *decode* bound: each packed byte costs an 8-float LUT load plus
-  an 8-float `x` load for only five useful values, so it leaves most of the
-  load throughput unused. `benchmarks/bench_gemv_roofline.py` measures this
-  directly: a dense f32 FMA (four times the bytes) reaches ~2× the GEMV's MAC
-  rate, and a pure read of the same packed bytes is ~30× faster. A 7B-shaped
-  layer compiled by `velocec` runs at 27.7 GMAC/s (4.3 tok/s for 32 layers).
-  A correct bandwidth roofline on this VM is ~14 tok/s, so the PRD's 15 tok/s
-  target is within reach *if the decode overhead is removed* — it is not a
-  hardware wall, and the honest status is "FAIL today, real headroom".
+* **Measured performance (4-vCPU shared VM, load average ~2.2)**: the AVX2
+  trit GEMV decodes 5 trits per byte with a 256-entry float LUT and works on
+  four output rows per pass, reaching ~8.8–9.3 GMAC/s on one thread and
+  19.7–23.0 GMAC/s on four (2.2–2.5×), i.e. 3.9–4.6 GB/s of packed weights:
+  **22–31% of the host's real streaming peak (12.6–20.8 GB/s at 4 threads)**,
+  not the 81–97% an earlier revision claimed — that figure compared a
+  single-threaded scalar probe against a four-thread SIMD kernel.
+
+  The four-row pass is what bought that. Flat base-3 packing puts row j at byte
+  `(j*K)/5`, slot `(j*K)%5`, so rows only share an `x` window when they are in
+  the same byte phase; the kernel therefore runs rows `j, j+p, j+2p, j+3p`
+  (`p = 5/gcd(K,5)`) and hands one pair of 32-byte `x` loads to four LUT loads
+  and four FMAs, instead of re-reading the whole `x` vector once per output
+  neuron. Measured back to back in one process by
+  `benchmarks/bench_gemv_roofline.py`, that is 1.33× (K=4096), 1.30× (K=1536)
+  and 1.34× (K=1024), medians of three runs, over the one-neuron-at-a-time
+  kernel; end to end it is 23.6 tok/s / 42.3 ms per token against 22.3 tok/s /
+  45–50 ms before.
+
+  The kernel is still *decode* bound, and the reason is now narrower: every
+  packed byte costs a byte load plus a 32-byte LUT load for five useful values,
+  and on this EPYC (128-bit FP units, 32-byte loads split in two) that is about
+  three load slots per five MACs — ~3.3 MAC/cycle, which is where the kernel
+  sits. A dense f32 FMA still reaches 1.5–2× the GEMV's MAC rate, and a pure
+  read of the same packed bytes is 23–36× faster. A 7B-shaped layer compiled by
+  `velocec` runs at 30–32 GMAC/s (4.7–4.9 tok/s for 32 layers). A correct
+  bandwidth roofline on this VM is 9.5–15.8 tok/s, so the PRD's 15 tok/s target
+  is only reachable *if the decode overhead is removed* — it is not a hardware
+  wall, and the honest status is "FAIL today, real headroom".
 * **End-to-end mid-size model** (`benchmarks/bench_midi_lm.py`): a genuine
   275.6M-ternary-parameter decoder (6 layers, d=1536, ffn=6144, V=32000,
   T=1 without KV cache) built with the production packing code, written as a
@@ -147,7 +160,7 @@ the capabilities come from the trained model.
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |
 | `make demo` | tiny-LM inference demo: ternary weights are 89.9% smaller than fp16 (PRD ≥80% target) |
-| `make bench-roofline` | where the trit GEMV's time actually goes: a pure read of the packed bytes, a dense-f32 FMA ceiling, and the shipped kernel, on identical data — shows the kernel is decode-bound (~19% of real peak), not at a memory wall |
+| `make bench-roofline` | where the trit GEMV's time actually goes: a pure read of the packed bytes, a dense-f32 FMA ceiling, one neuron at a time, and the shipped four-row kernel, on identical data — shows the kernel is decode-bound (22–31% of real peak), not at a memory wall |
 | `make bench-throughput` | real measured throughput vs the PRD targets: trit GEMV GMAC/s, attention GFLOP/s, projected 7B-class tokens/s, memory-bandwidth roofline, footprint and compile-time checks |
 | `make bench-midi` | end-to-end 275.6M-ternary decoder: real `.veloce` weights, mmap'd forward pass, measured tok/s, determinism hash and optional NumPy verification |
 | `velocec model-card FILE.veloce` | prints the capability model card embedded in a `.veloce` export; `make train` and `make bench-midi` both write one |

@@ -921,25 +921,155 @@ static inline float veloce_trit_dot(const float *x, const uint8_t *w, size_t bas
 
 typedef struct { float *out; const float *x; const uint8_t *w; size_t M, K, N; } veloce_mm_trit_ctx;
 
-/* one output row of a GEMV: out[i][j] for all j, fixed j-major order */
-static inline void veloce_mm_trit_gemv_chunk(void *vctx, size_t j) {
+/* ---- Four output rows per pass -------------------------------------
+ * The packed matrix is flat: element (j,k) lives at trit index j*K+k, i.e.
+ * byte (j*K+k)/5, slot (j*K+k)%5.  Row j therefore starts at slot (j*K)%5, and
+ * rows can only share x loads when they are in the same phase.  Rows
+ * j, j+p, j+2p, j+3p with p = 5/gcd(K,5) all start at that same slot and then
+ * advance exactly one byte per five trits, so they read the same x window at
+ * every step: one pair of 32-byte x loads now feeds four LUT loads and four
+ * FMAs.  Before this, every output neuron re-read the whole x vector (a
+ * 32-byte load for 5 useful values, K/5 times) -- the reason the kernel decoded
+ * at ~19% of this machine's FMA rate.
+ *
+ * Four rows in flight also give the out-of-order engine four independent
+ * accumulator chains, which is what hides the byte-load -> LUT-load dependency
+ * the one-row-at-a-time loop serialised on.
+ *
+ * No row's arithmetic changes: each row keeps two accumulator chains and a
+ * fixed reduction order, so a row's value never depends on which other rows
+ * share its pass, nor on the thread count. */
+#define VELOCE_TRIT_ROWS 4
+
+/* Byte phase repeats every `p` rows of a flat [N, K] trit matrix. */
+static inline size_t veloce_trit_phase(size_t K) { return (K % 5 == 0) ? 1 : 5; }
+
+#if defined(VELOCE_HAVE_TRIT_AVX2)
+/* Four rows starting at trit index base, base+stride5*5, base+2*stride5*5,
+ * base+3*stride5*5 -- all in the same byte phase. */
+static inline void veloce_trit_dot4_avx2(const float *restrict x, const uint8_t *restrict w,
+                                         size_t base, size_t stride5, size_t K,
+                                         float *restrict out) {
+    __m256 acc[VELOCE_TRIT_ROWS][2];
+    for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+        acc[r][0] = _mm256_setzero_ps();
+        acc[r][1] = _mm256_setzero_ps();
+        out[r] = 0.0f;
+    }
+    const size_t skip = base % 5;       /* slot of the group's first trit */
+    size_t bi = base / 5;               /* byte that holds it */
+    size_t q = 0;
+    if (skip) {
+        /* Finish the partial first byte (at most four trits) in scalar. */
+        const size_t n = (5 - skip < K) ? 5 - skip : K;
+        for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+            const float *v = VELOCE_TRIT_LUT_F32[w[bi + (size_t)r * stride5]];
+            float t = 0.0f;
+            for (size_t s = 0; s < n; s++) t += x[s] * v[skip + s];
+            out[r] = t;
+        }
+        q = n;
+        bi += 1;                        /* first whole byte of every row */
+    }
+    const size_t full = (K - q) / 5;    /* whole packed bytes per row */
+    size_t b = 0;
+    /* A four-byte block reads x[..q+22] (eight floats from each of q, q+5,
+     * q+10, q+15), so it may only run while 23 elements remain -- the same
+     * bound as the single-row kernel, which keeps every read in bounds. */
+    for (; b + 4 <= full && q + 23 <= K; b += 4, q += 20) {
+        const __m256 x0 = _mm256_loadu_ps(x + q);
+        const __m256 x1 = _mm256_loadu_ps(x + q + 5);
+        const __m256 x2 = _mm256_loadu_ps(x + q + 10);
+        const __m256 x3 = _mm256_loadu_ps(x + q + 15);
+        for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+            const uint8_t *wr = w + bi + (size_t)r * stride5 + b;
+            acc[r][0] = _mm256_fmadd_ps(x0, _mm256_load_ps(VELOCE_TRIT_LUT_F32[wr[0]]), acc[r][0]);
+            acc[r][1] = _mm256_fmadd_ps(x1, _mm256_load_ps(VELOCE_TRIT_LUT_F32[wr[1]]), acc[r][1]);
+            acc[r][0] = _mm256_fmadd_ps(x2, _mm256_load_ps(VELOCE_TRIT_LUT_F32[wr[2]]), acc[r][0]);
+            acc[r][1] = _mm256_fmadd_ps(x3, _mm256_load_ps(VELOCE_TRIT_LUT_F32[wr[3]]), acc[r][1]);
+        }
+    }
+    for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+        const __m256 s = _mm256_add_ps(acc[r][0], acc[r][1]);
+        const __m128 lo = _mm256_castps256_ps128(s);
+        const __m128 hi = _mm256_extractf128_ps(s, 1);
+        __m128 t = _mm_add_ps(lo, hi);
+        t = _mm_hadd_ps(t, t); t = _mm_hadd_ps(t, t);
+        float a = out[r] + _mm_cvtss_f32(t);
+        const uint8_t *wr = w + bi + (size_t)r * stride5;
+        size_t ee = b, qq = q;
+        for (; ee < full; ee++, qq += 5) {
+            const float *v = VELOCE_TRIT_LUT_F32[wr[ee]];
+            a += x[qq] * v[0] + x[qq + 1] * v[1] + x[qq + 2] * v[2]
+               + x[qq + 3] * v[3] + x[qq + 4] * v[4];
+        }
+        if (qq < K) {
+            const float *v = VELOCE_TRIT_LUT_F32[wr[ee]];   /* the row's last, partial byte */
+            for (size_t k = qq, slot = 0; k < K; k++, slot++) a += x[k] * v[slot];
+        }
+        out[r] = a;
+    }
+}
+#endif
+
+static inline void veloce_trit_dot4(const float *x, const uint8_t *w, size_t base,
+                                    size_t stride5, size_t K, float *out) {
+#if defined(VELOCE_HAVE_TRIT_AVX2)
+    veloce_trit_dot4_avx2(x, w, base, stride5, K, out);
+#else
+    for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++)
+        out[r] = veloce_trit_dot(x, w, base + r * stride5 * 5, K);
+#endif
+}
+
+/* One GEMV work item: a tile of VELOCE_TRIT_ROWS*phase neurons, run as `phase`
+ * groups of four rows that share a byte phase. */
+static inline void veloce_mm_trit_gemv_chunk(void *vctx, size_t t) {
     const veloce_mm_trit_ctx *c = (const veloce_mm_trit_ctx *)vctx;
-    c->out[j] = veloce_trit_dot(c->x, c->w, j * c->K, c->K);
+    const size_t period = veloce_trit_phase(c->K);
+    const size_t tile = VELOCE_TRIT_ROWS * period;
+    const size_t stride5 = period * c->K / 5;
+    const size_t j0 = t * tile;
+    if (j0 + tile <= c->N) {
+        for (size_t ph = 0; ph < period; ph++) {
+            float part[VELOCE_TRIT_ROWS];
+            veloce_trit_dot4(c->x, c->w, (j0 + ph) * c->K, stride5, c->K, part);
+            for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++)
+                c->out[j0 + ph + r * period] = part[r];
+        }
+        return;
+    }
+    for (size_t j = j0; j < c->N; j++)
+        c->out[j] = veloce_trit_dot(c->x, c->w, j * c->K, c->K);
 }
 static inline void veloce_mm_trit_row(void *vctx, size_t i) {
     const veloce_mm_trit_ctx *c = (const veloce_mm_trit_ctx *)vctx;
     const float *xr = c->x + i * c->K;
-    for (size_t j = 0; j < c->N; j++)
-        c->out[i * c->N + j] = veloce_trit_dot(xr, c->w, j * c->K, c->K);
+    const size_t period = veloce_trit_phase(c->K);
+    const size_t tile = VELOCE_TRIT_ROWS * period;
+    const size_t stride5 = period * c->K / 5;
+    float *orow = c->out + i * c->N;
+    size_t j0 = 0;
+    for (; j0 + tile <= c->N; j0 += tile)
+        for (size_t ph = 0; ph < period; ph++) {
+            float part[VELOCE_TRIT_ROWS];
+            veloce_trit_dot4(xr, c->w, (j0 + ph) * c->K, stride5, c->K, part);
+            for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++)
+                orow[j0 + ph + r * period] = part[r];
+        }
+    for (; j0 < c->N; j0++)
+        orow[j0] = veloce_trit_dot(xr, c->w, j0 * c->K, c->K);
 }
 static inline void veloce_matmul_trit(float *out, const float *x, const uint8_t *w,
                                       size_t M, size_t K, size_t N) {
     veloce_mm_trit_ctx c = { out, x, w, M, K, N };
     const size_t row_bytes = veloce_trit_rowbytes(K);
+    const size_t tile = VELOCE_TRIT_ROWS * veloce_trit_phase(K);
     if (M == 1) {
-        /* GEMV: one work item = one output neuron; it streams `row_bytes`
-         * contiguous packed weights, which is exactly the cache-unit tile. */
-        veloce_parallel_for_sized(N, row_bytes, veloce_mm_trit_gemv_chunk, &c);
+        /* GEMV: one work item = one tile of output neurons in the same byte
+         * phase; it streams tile*row_bytes of packed weights. */
+        veloce_parallel_for_sized((N + tile - 1) / tile, tile * row_bytes,
+                                  veloce_mm_trit_gemv_chunk, &c);
     } else {
         veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_trit_row, &c);
     }
@@ -1134,22 +1264,54 @@ static inline float veloce_trit_dot_scaled(const float *x, const uint8_t *w,
 }
 typedef struct { float *out; const float *x; const uint8_t *w; const float *s;
                  size_t M, K, N; } veloce_mm_trits_ctx;
-static inline void veloce_mm_trits_gemv_row(void *vctx, size_t j) {
+static inline void veloce_mm_trits_gemv_row(void *vctx, size_t t) {
     const veloce_mm_trits_ctx *c = (const veloce_mm_trits_ctx *)vctx;
-    c->out[j] = veloce_trit_dot_scaled(c->x, c->w, c->s[j], j * c->K, c->K);
+    const size_t period = veloce_trit_phase(c->K);
+    const size_t tile = VELOCE_TRIT_ROWS * period;
+    const size_t stride5 = period * c->K / 5;
+    const size_t j0 = t * tile;
+    if (j0 + tile <= c->N) {
+        for (size_t ph = 0; ph < period; ph++) {
+            float part[VELOCE_TRIT_ROWS];
+            veloce_trit_dot4(c->x, c->w, (j0 + ph) * c->K, stride5, c->K, part);
+            for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++) {
+                const size_t j = j0 + ph + r * period;
+                c->out[j] = c->s[j] * part[r];
+            }
+        }
+        return;
+    }
+    for (size_t j = j0; j < c->N; j++)
+        c->out[j] = veloce_trit_dot_scaled(c->x, c->w, c->s[j], j * c->K, c->K);
 }
 static inline void veloce_mm_trits_mat_row(void *vctx, size_t i) {
     const veloce_mm_trits_ctx *c = (const veloce_mm_trits_ctx *)vctx;
     const float *xr = c->x + i * c->K;
-    for (size_t j = 0; j < c->N; j++)
-        c->out[i * c->N + j] = veloce_trit_dot_scaled(xr, c->w, c->s[j], j * c->K, c->K);
+    const size_t period = veloce_trit_phase(c->K);
+    const size_t tile = VELOCE_TRIT_ROWS * period;
+    const size_t stride5 = period * c->K / 5;
+    float *orow = c->out + i * c->N;
+    size_t j0 = 0;
+    for (; j0 + tile <= c->N; j0 += tile)
+        for (size_t ph = 0; ph < period; ph++) {
+            float part[VELOCE_TRIT_ROWS];
+            veloce_trit_dot4(xr, c->w, (j0 + ph) * c->K, stride5, c->K, part);
+            for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++) {
+                const size_t j = j0 + ph + r * period;
+                orow[j] = c->s[j] * part[r];
+            }
+        }
+    for (; j0 < c->N; j0++)
+        orow[j0] = veloce_trit_dot_scaled(xr, c->w, c->s[j0], j0 * c->K, c->K);
 }
 static inline void veloce_matmul_trit_s(float *out, const float *x, const uint8_t *w,
                                         const float *scales, size_t M, size_t K,
                                         size_t N) {
     veloce_mm_trits_ctx c = { out, x, w, scales, M, K, N };
     const size_t row_bytes = veloce_trit_rowbytes(K) + sizeof(float);
-    if (M == 1) veloce_parallel_for_sized(N, row_bytes, veloce_mm_trits_gemv_row, &c);
+    const size_t tile = VELOCE_TRIT_ROWS * veloce_trit_phase(K);
+    if (M == 1) veloce_parallel_for_sized((N + tile - 1) / tile, tile * row_bytes,
+                                          veloce_mm_trits_gemv_row, &c);
     else        veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_trits_mat_row, &c);
 }
 

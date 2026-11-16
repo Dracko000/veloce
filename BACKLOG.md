@@ -41,42 +41,40 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. Trit GEMV is decode-bound: ~19% of real peak, so there is headroom
-
-The docs used to say the kernel sat at the bandwidth roofline. That was a
-measurement error: the "streaming peak" was a scalar single-threaded loop.
-Real peak on this VM is **18.7 GB/s at 4 threads**; the GEMV does **3.6 GB/s,
-19%**. `make bench-roofline` shows a dense f32 FMA reaching ~2x the GEMV's MAC
-rate while reading 4x the bytes, and a pure read of the same packed bytes being
-~30x faster. So the kernel is limited by the decode, not memory.
-
-Every output neuron reloads the whole `x` vector (an 8-float AVX load per
-packed byte, caching 32 bytes for 5 useful values), and the LUT decode costs
-one 32-byte load + one FMA per packed byte. The obvious win is to process
-several output rows per pass so the `x` loads are amortised.
-
-**Blocker that stopped it:** trit rows are *not byte-aligned* — row j starts at
-flat trit index `j*K`, byte `j*K/5`, slot `(j*K)%5` — so `w + j*rowbytes`
-is the wrong pointer for row j, which is why a naive multi-row kernel
-segfaulted. Any multi-row kernel has to carry the flat element index and use
-`w[e/5]` / slot `e%5`, or the on-disk format and `.veloce` layout must change
-(padding rows to byte boundaries costs ≤4 bits per row and would make rows
-individually addressable). Decide which, then implement and measure.
-
-Target: beat 19% of peak. Anything that does should be visible in
-`make bench-midi` tok/s and in `make bench-roofline`'s kernel/ceiling ratio.
-
-### 2. `benchmarks/midi_lm_results.json` has no cached block
+### 1. `benchmarks/midi_lm_results.json` has no cached block
 
 The cached numbers (27.84 tok/s, 32 tokens, 64 slots) live only in reports and
 logs, not the committed artefact. Add them so the JSON tells the whole story.
 
-### 3. Attention masking for 2-D masks
+### 2. Attention masking for 2-D masks
 
 `softmax(x, mask)` validates 2-D masks but only 1-D masks are exercised. A
 per-row mask (per-head causal) deserves a test.
 
 ## Done (most recent first)
+
+* **Trit GEMV: four output rows per pass, grouped by byte phase.** Flat
+  base-3 packing puts row j at byte `(j*K)/5`, slot `(j*K)%5`, so rows only
+  share an `x` window when they are in the same phase. Padding every row to a
+  byte boundary was prototyped and measured first: it works (1.2-1.6x) but
+  needs a new `.veloce` layout, so it was dropped. The shipped kernel keeps
+  the flat format and instead groups rows `j, j+p, j+2p, j+3p`
+  (`p = 5/gcd(K,5)`), which all start at slot `(j*K)%5` and then advance one
+  byte per five trits: one pair of 32-byte `x` loads now feeds four LUT loads
+  and four FMAs instead of re-reading `x` for every output neuron. Measured
+  in one process by `make bench-roofline`, median of three runs:
+  **1.33x (K=4096), 1.30x (K=1536), 1.34x (K=1024)** over the
+  one-neuron-at-a-time kernel; 1-thread GEMV 8.8-9.3 GMAC/s, 4 threads
+  19.7-23.0 GMAC/s (2.2-2.5x), **22-31% of the streaming peak instead of 19%**.
+  End to end `make bench-midi`: **23.6 tok/s, 42.3 ms/token** (was 22.3 tok/s,
+  45-50 ms), determinism PASS, verify rel err 1.54e-6. New test
+  `test_trit_gemv_phase_grouped_rows` (K=1003 -> p=5, N=20 = one tile) checks
+  the grouped path against a float64 reference and pins the batched path to it
+  bit for bit; with the phase stride broken on purpose it fails at
+  `maxerr=5.361e+01` (mutation-verified), so the test has teeth. Remaining
+  wall, now narrower: one byte load + one 32-byte LUT load per five MACs is
+  ~3 load slots per 5 MACs on this 128-bit-wide EPYC, i.e. ~3.3 MAC/cycle --
+  not memory bandwidth.
 
 * Corrected the bandwidth claims and fixed the benchmark that produced them.
   `bench_membw` was a scalar 1-thread loop compared against a 4-thread SIMD
