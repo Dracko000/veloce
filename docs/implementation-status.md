@@ -75,11 +75,16 @@ real module (see `test_erd_introspection`).
   caller-owned mutable buffer, and `cache[pos] = row` stores a whole row into
   it, so a host loop can keep keys/values across calls. `examples/kv_decode.vel`
   plus `examples/run_kv_decode.py` decode five tokens this way (max |err|
-  7.7e-7 per token, 1.0e-6 for the cached attention). Attention masking is
-  expressed as an additive `f32[CT]` bias of `-1e30` on the scores, which
-  `softmax` underflows to exactly zero; `test_cached_decode_attention_mask`
-  decodes four tokens through a 1-, 2- and 3-layer cached decoder and checks
-  the result against a strictly causal float64 reference.
+  7.7e-7 per token, 1.0e-6 for the cached attention). Attention masking is a
+  first-class builtin: `softmax(scores, mask)` with an `i32` mask (non-zero =
+  participates) excludes hidden entries from both the row maximum and the
+  normaliser, so a hidden entry contributes exactly zero whatever it holds —
+  a stale cache row, `NaN` or `±1e30` cannot reach the result
+  (`test_masked_softmax_builtin` poisons the hidden columns with exactly
+  those values). A fully masked row returns zeros, not `NaN`.
+  `test_cached_decode_attention_mask` decodes four tokens through a 1-, 2- and
+  3-layer cached decoder and checks the result against a strictly causal
+  float64 reference.
 * **FR-4.2 threading policy**: work is split over *independent output*
   elements only (rows for matmul/rmsnorm/softmax, elements for elementwise
   ops), never over a reduction axis, which is why bit-exact determinism is

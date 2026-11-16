@@ -536,6 +536,13 @@ class CodeGen:
             t = getattr(e.args[0], "ctype")
             n = numel(t)
             self.emit(f"veloce_softmax({d}, {x}, {n}, {t.dims[-1].value});")
+        elif lower == "softmax_mask":
+            x = self.tptr(e.args[0])
+            m = self.tptr(e.args[1])
+            t = getattr(e.args[0], "ctype")
+            n = numel(t)
+            self.emit(f"veloce_softmax_masked({d}, {x}, {m}, {n}, "
+                      f"{t.dims[-1].value});")
         elif lower == "transpose":
             x = self.tptr(e.args[0])
             t = getattr(e.args[0], "ctype")

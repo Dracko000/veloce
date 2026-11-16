@@ -47,7 +47,7 @@ sys.path.insert(0, ROOT)
 import veloce  # noqa: E402
 from veloce import weights as vw  # noqa: E402
 from veloce.codegen import ctype_of  # noqa: E402
-from veloce.lmmodule import (DEFAULT_CONFIG, MASK_HIDDEN, attn_scale,  # noqa: E402
+from veloce.lmmodule import (DEFAULT_CONFIG, attn_scale,  # noqa: E402
                              cache_buffers, cached_module, decoder_module,
                              normalize_config)
 
@@ -399,7 +399,7 @@ static uint64_t fnv1a(const void *p, size_t n) {
 
 __CACHE_DECLS__
 
-static float mask_buf[__CT__];
+static int32_t mask_buf[__CT__];
 
 static const int toks[__NTOK__] = { __TOKS__ };
 
@@ -416,23 +416,24 @@ int main(int argc, char **argv) {
                                     MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) { perror("mmap"); return 1; }
 
-    /* A visible slot keeps a finite score, so exp() underflows the hidden
-       ones to exactly 0.0f instead of producing inf - inf. */
-    for (int i = 0; i < CT; i++) mask_buf[i] = __MASK_HIDDEN__f;
+    /* mask_buf[i] != 0 marks a slot that participates in softmax; hidden
+       slots are excluded from the max and the normaliser entirely, so their
+       content can never affect a score. */
+    for (int i = 0; i < CT; i++) mask_buf[i] = 0;
 
     float *out = NULL;
     /* Warmup: two steps at pos 0, which writes the same row twice. */
     for (int t = 0; t < 2; t++) {
-        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= 0) ? 0.0f : __MASK_HIDDEN__f;
+        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= 0) ? 1 : 0;
         out = veloce_forward_cached(
         __CARGS__);
     }
 
     /* Untimed pass for bit-exact determinism of the whole decode. */
     __CACHE_ZERO__
-    for (int i = 0; i < CT; i++) mask_buf[i] = __MASK_HIDDEN__f;
+    for (int i = 0; i < CT; i++) mask_buf[i] = 0;
     for (int t = 0; t < __NTOK__; t++) {
-        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 0.0f : __MASK_HIDDEN__f;
+        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 1 : 0;
         out = veloce_forward_cached(
         __CARGS__);
     }
@@ -440,10 +441,10 @@ int main(int argc, char **argv) {
     memcpy(ref, out, (size_t)V * sizeof(float));
 
     __CACHE_ZERO__
-    for (int i = 0; i < CT; i++) mask_buf[i] = __MASK_HIDDEN__f;
+    for (int i = 0; i < CT; i++) mask_buf[i] = 0;
     double t0 = now_ns();
     for (int t = 0; t < __NTOK__; t++) {
-        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 0.0f : __MASK_HIDDEN__f;
+        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 1 : 0;
         out = veloce_forward_cached(
         __CARGS__);
     }
@@ -525,7 +526,6 @@ def build_and_run_cached(man, cfg, wpath, ct, ntok, dump, workdir):
                .replace("__CACHE_DECLS__", decls)
                .replace("__CACHE_ZERO__", zero)
                .replace("__CARGS__", cargs)
-               .replace("__MASK_HIDDEN__", repr(float(MASK_HIDDEN)))
                .replace("__CT__", str(ct))
                .replace("__NTOK__", str(ntok))
                .replace("__TOKS__", ", ".join(str(t) for t in toks))

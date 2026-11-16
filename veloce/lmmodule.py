@@ -129,12 +129,12 @@ fn forward(
 # caller-owned key/value row for the current position (`ck[pos] = k`) and
 # attends over every slot with an additive mask that hides slots past `pos`.
 #
-# The mask is a plain `f32[CT]` bias (0 for visible slots, `MASK_HIDDEN` for
-# the rest) added to the scores before softmax, so no new builtin is needed.
-# A hidden slot's score becomes ~-1e30 and `exp()` underflows it to exactly 0,
-# while the visible slots keep a finite maximum (position 0 is always
-# visible), so the row never sees `inf - inf`.
-MASK_HIDDEN = -1e30
+# The cache mask is `i32[CT]`: 1 for a written slot, 0 for one that must be
+# ignored.  It is passed to `softmax(scores, mask)`, which excludes hidden
+# entries from both the max and the normaliser, so a stale or garbage cache
+# row cannot influence the result at all.  (This used to be an `f32` bias of
+# -1e30 added to the scores, which only worked while nothing overflowed.)
+MASK_HIDDEN = 0
 
 
 def cached_module(cfg, cache_slots):
@@ -156,10 +156,10 @@ dim F = {F}
 dim CT = {CT}
 
 fn attn_c(q: f32[1, D], ck: f32[CT, D], cv: f32[CT, D],
-          mask: f32[CT]) -> f32[1, D] {{
+          mask: i32[CT]) -> f32[1, D] {{
     let kt = transpose(ck)
-    let scores = matmul(q, kt) * {attn_scale(cfg):.9g} + mask
-    let probs = softmax(scores)
+    let scores = matmul(q, kt) * {attn_scale(cfg):.9g}
+    let probs = softmax(scores, mask)
     return matmul(probs, cv)
 }}
 
@@ -167,7 +167,7 @@ fn layer_c(x: f32[1, D], nw: f32[D],
            wq: trit[D, D], wk: trit[D, D], wv: trit[D, D], wo: trit[D, D],
            w1: trit[F, D], w2: trit[D, F], w3: trit[F, D],
            rw ck: f32[CT, D], rw cv: f32[CT, D],
-           mask: f32[CT], pos: i32) -> f32[1, D] {{
+           mask: i32[CT], pos: i32) -> f32[1, D] {{
     let xn = rmsnorm(x, nw)
     let q = matmul_trit(xn, wq)
     let k = matmul_trit(xn, wk)
@@ -189,7 +189,7 @@ fn forward_cached(
     emb: fp16[V, D],
     tok: i32,
     pos: i32,
-    mask: f32[CT],"""]
+    mask: i32[CT],"""]
 
     for l in range(1, L + 1):
         out.append(f"    rw ck{l}: f32[CT, D],")

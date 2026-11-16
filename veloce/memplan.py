@@ -174,7 +174,7 @@ class Planner:
                     "matmul_i4g", "matmul_i2g", "matmul_fp8g",
                     "matmul_f16wt", "matmul_i2", "matmul_i2_s",
                     "matmul_fp8", "matmul_fp8_s", "rmsnorm", "silu", "relu",
-                    "softmax", "rope", "rope_heads", "embedding", "transpose",
+                    "softmax", "softmax_mask", "rope", "rope_heads", "embedding", "transpose",
                     "rowmax", "embedding_seq", "meanpool", "zeros"):
                 words = self._words(t)
                 a = Allocation(e, words, self.step, self.step)

@@ -1700,6 +1700,54 @@ static inline void veloce_softmax(float *out, const float *x, size_t total, size
     veloce_parallel_for_sized(total / cols, cols * 2 * sizeof(float), veloce_softmax_row, &c);
 }
 
+/* Masked softmax: an integer mask broadcast across rows hides entries.
+ *   mask[i] != 0  -> entry i participates
+ *   mask[i] == 0  -> entry i gets probability exactly 0
+ * The max and the sum are taken over visible entries only, so a hidden entry
+ * can never reach the result no matter what it contains -- there is no sentinel
+ * magnitude to overflow, which is what the old `score + -1e30` convention
+ * relied on.  A row with nothing visible produces all zeros (not NaN), since
+ * a fully-masked row has no distribution to normalise.
+ * Accumulation stays in index order per row, so results are bit-identical at
+ * every thread count. */
+typedef struct { float *out; const float *x; const int32_t *mask; size_t cols; }
+        veloce_softmax_mask_ctx;
+static inline void veloce_softmax_mask_row(void *vctx, size_t r) {
+    const veloce_softmax_mask_ctx *c = (const veloce_softmax_mask_ctx *)vctx;
+    const float *xr = c->x + r * c->cols;
+    float *orow = c->out + r * c->cols;
+    float mx = -INFINITY;
+    int any = 0;
+    for (size_t i = 0; i < c->cols; i++) {
+        if (c->mask[i]) {
+            if (xr[i] > mx) mx = xr[i];
+            any = 1;
+        }
+    }
+    if (!any) {
+        for (size_t i = 0; i < c->cols; i++) orow[i] = 0.0f;
+        return;
+    }
+    float sum = 0.0f;
+    for (size_t i = 0; i < c->cols; i++) {
+        if (c->mask[i]) {
+            float e = expf(xr[i] - mx);
+            orow[i] = e;
+            sum += e;
+        } else {
+            orow[i] = 0.0f;
+        }
+    }
+    const float inv = 1.0f / sum;
+    for (size_t i = 0; i < c->cols; i++) orow[i] *= inv;
+}
+static inline void veloce_softmax_masked(float *out, const float *x, const int32_t *mask,
+                                         size_t total, size_t cols) {
+    veloce_softmax_mask_ctx c = { out, x, mask, cols };
+    veloce_parallel_for_sized(total / cols, cols * 2 * sizeof(float),
+                              veloce_softmax_mask_row, &c);
+}
+
 /* Matrix transpose: in [R,C] -> out [C,R]. Parallel across input rows. */
 typedef struct { float *out; const float *in; size_t R, C; } veloce_transpose_ctx;
 static inline void veloce_transpose_row(void *vctx, size_t r) {

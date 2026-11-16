@@ -698,8 +698,45 @@ class Checker:
         return ast.TensorType(ast.ScalarType(FLOAT_PRIM), x.dims)
 
     def bi_softmax(self, e):
+        """softmax(x) or softmax(x, mask).
+
+        The two-argument form hides entries instead of biasing them: an entry
+        whose mask value is 0 gets probability exactly 0, and the row's max
+        and normaliser are computed over visible entries only.  A hidden entry
+        can therefore hold any value (a stale cache row, a garbage slot)
+        without affecting the result, which the old `score + -1e30` trick
+        could not guarantee.
+        """
         x = self._tensor_arg(e, 0, "softmax", e)
-        e.lower = "softmax"
+        if len(e.args) > 1:
+            m = self._tensor_arg(e, 1, "softmax", e)
+            if len(e.args) > 2:
+                raise TypeError_("softmax takes at most two arguments", e.line, e.col)
+            if x.rank != 2:
+                raise TypeError_("masked softmax requires a 2-D scores tensor",
+                                 e.line, e.col)
+            if m.dtype.name not in ("i32", "i64", "i8", "u8", "i2", "i4"):
+                raise TypeError_(
+                    f"softmax mask must be an integer tensor (0 = hidden), got {m.dtype}",
+                    e.line, e.col)
+            hidden_dim = x.dims[-1]
+            if m.rank == 1:
+                if not (m.dims[0].is_symbol or hidden_dim.is_symbol
+                        or m.dims[0].value == hidden_dim.value):
+                    raise TypeError_(
+                        f"softmax mask length {m.dims[0]} does not match the "
+                        f"last dimension {hidden_dim}", e.line, e.col)
+            elif m.rank == 2:
+                if not (m.dims[1].is_symbol or hidden_dim.is_symbol
+                        or m.dims[1].value == hidden_dim.value):
+                    raise TypeError_(
+                        f"softmax mask width {m.dims[1]} does not match the "
+                        f"last dimension {hidden_dim}", e.line, e.col)
+            else:
+                raise TypeError_("softmax mask must be 1-D or 2-D", e.line, e.col)
+            e.lower = "softmax_mask"
+        else:
+            e.lower = "softmax"
         return ast.TensorType(ast.ScalarType(FLOAT_PRIM), x.dims)
 
     def bi_transpose(self, e):

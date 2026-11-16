@@ -1207,7 +1207,7 @@ def test_cached_decode_attention_mask():
 
 def _check_cached_decode(L):
     """One cached decode of four tokens through an `L`-layer decoder."""
-    from veloce.lmmodule import MASK_HIDDEN, cached_module
+    from veloce.lmmodule import cached_module
 
     V, D, F, CT = 16, 8, 16, 4
     cfg = dict(name=f"kvtest{L}", V=V, D=D, F=F, layers=L)
@@ -1236,7 +1236,7 @@ def _check_cached_decode(L):
 
     decls = [f"static float ck[{L}][{CT*D}] = {{0}};",
              f"static float cv[{L}][{CT*D}] = {{0}};",
-             f"static float mask[{CT}];"]
+             f"static int32_t mask[{CT}];"]
     # `emb` is fp16 storage: the C runtime takes a uint16_t table.
     decls.append("    " + carr("emb", "uint16_t",
                                list(emb.astype(np.float16).view(np.uint16)
@@ -1271,8 +1271,7 @@ def _check_cached_decode(L):
     loop = []
     for t, tok in enumerate(toks):
         loop.append(
-            f"    for (int i = 0; i < {CT}; i++) mask[i] = (i <= {t}) ? 0.0f "
-            f": {cf(MASK_HIDDEN)};")
+            f"    for (int i = 0; i < {CT}; i++) mask[i] = (i <= {t}) ? 1 : 0;")
         args = ", ".join(_cached_arg(p.name, tok, t)
                          for p in cached_fn.params)
         loop.append(f"    float *o{t} = veloce_forward_cached({args});")
@@ -1448,6 +1447,103 @@ fn f(x: f32[M, K], w: {dtype}[N, K], s: f32[N, NG]) -> f32[M, N] {{
             assert "divide K exactly" in str(e), e
         else:
             raise AssertionError(f"{name} accepted K=100 over 7 groups")
+
+
+def test_masked_softmax_builtin():
+    """`softmax(x, mask)` hides entries without biasing them.
+
+    The point of a mask builtin (over adding -1e30 to the scores) is that a
+    hidden entry's *value* is irrelevant: it can be NaN or +-1e30 and still
+    contributes exactly zero.  This test poisons the hidden columns with
+    exactly those values.
+    """
+    import veloce
+    T, C = 3, 4
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal((T, C)).astype(np.float32)
+    x[0, 2] = 1e30
+    x[0, 3] = -1e30
+    x[1, 2] = np.nan            # hidden, must not reach the result
+    mask = np.array([1, 1, 0, 0], dtype=np.int32)
+
+    src = f"""module sm
+dim T = {T}
+dim C = {C}
+fn f(x: f32[T, C], m: i32[C]) -> f32[T, C] {{
+    return softmax(x, m)
+}}
+"""
+    c = veloce.compile_source(src, module_name="sm").c_source
+    assert "veloce_softmax_masked(" in c, c
+
+    driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+float *veloce_f(float*,int32_t*);
+int main(void) {{
+    float x[{T*C}] = {{ {", ".join(cf(v) for v in x.flatten())} }};
+    int32_t m[{C}] = {{ {", ".join(str(v) for v in mask)} }};
+    float *o = veloce_f(x, m);
+    for (int i = 0; i < {T*C}; i++) printf("%a\\n", o[i]);
+    return 0;
+}}
+"""
+    outs = {}
+    for pool in (0, 1, 2):
+        rc, out, err, _ = _threads_build(src, driver, pool, 4, name=f"smask{pool}")
+        assert rc == 0, err
+        outs[pool] = out
+    assert outs[0] == outs[1] == outs[2], "masked softmax differs across threads"
+
+    got = np.array([float.fromhex(v) for v in outs[0].split()]).reshape(T, C)
+    hidden = ~mask.astype(bool)
+    assert np.array_equal(got[:, hidden], np.zeros((T, 2), dtype=got.dtype)), got
+    assert np.allclose(got.sum(axis=1), 1.0, atol=1e-6), got.sum(axis=1)
+    ref = np.zeros((T, C))
+    for r in range(T):
+        vis = x[r][mask.astype(bool)].astype(np.float64)
+        e = np.exp(vis - vis.max())
+        ref[r][mask.astype(bool)] = e / e.sum()
+    assert np.abs(got - ref).max() < 1e-6, (got, ref)
+
+    # An entirely masked row has no distribution: zeros, never NaN.
+    src2 = f"""module sm2
+dim C = {C}
+fn g(x: f32[1, C], m: i32[C]) -> f32[1, C] {{
+    return softmax(x, m)
+}}
+"""
+    driver2 = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+float *veloce_g(float*,int32_t*);
+int main(void) {{
+    float x[{C}] = {{ {", ".join(cf(v) for v in x[0])} }};
+    int32_t m[{C}] = {{ 0, 0, 0, 0 }};
+    float *o = veloce_g(x, m);
+    for (int i = 0; i < {C}; i++) printf("%a\\n", o[i]);
+    return 0;
+}}
+"""
+    rc, out, err, _ = util.build_and_run(src2, driver2, name="smask_all")
+    assert rc == 0, err
+    allhid = np.array([float.fromhex(v) for v in out.split()])
+    assert np.array_equal(allhid, np.zeros(C, dtype=allhid.dtype)), allhid
+
+
+def test_masked_softmax_rejects_bad_mask():
+    """A mask must be integer and match the last dimension."""
+    import veloce
+    for mask_ty, mask_dim in (("f32", 4), ("i32", 3)):
+        src = f"""module t
+dim C = 4
+dim M = {mask_dim}
+fn f(x: f32[2, C], m: {mask_ty}[M]) -> f32[2, C] {{
+    return softmax(x, m)
+}}
+"""
+        with np.testing.assert_raises(Exception):
+            veloce.compile_source(src, module_name="t")
 
 
 def _rmsnorm64(x, w):
