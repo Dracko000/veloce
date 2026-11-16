@@ -94,14 +94,20 @@ real module (see `test_erd_introspection`).
   the smallest problem that is worth a fork-join.
 * **Measured performance (4-vCPU shared VM, load average ~2.7)**: the AVX2
   trit GEMV decodes 5 trits per byte with a 256-entry float LUT and 4
-  independent accumulators, reaching 7.6 GMAC/s on one thread and 15.5–19.4
-  GMAC/s on four (2.1–2.5×); that is 3.1–3.9 GB/s of packed weights, 81–97% of
-  the host's measured 3.8–4.0 GB/s streaming-read peak, i.e. the kernel is at
-  the bandwidth roofline (the remaining spread is host contention, not code). A 7B-shaped layer
-  compiled by `velocec` runs at 21.4–27.5 GMAC/s (3.3–4.3 tok/s projected for
-  32 layers), against a memory-bandwidth roofline of ~2.9–3.0 tok/s — so on
-  this machine the PRD's 15 tok/s target is unreachable by any implementation,
-  not just this one.
+  independent accumulators, reaching ~7.6 GMAC/s on one thread and 15.5–19.4
+  GMAC/s on four (2.1–2.5×), i.e. ~3.6 GB/s of packed weights. **This is 19%
+  of the host's real streaming peak (18.7 GB/s at 4 threads, 5.4 at 1), not
+  the 81–97% an earlier revision claimed** — that figure compared a
+  single-threaded scalar probe against a four-thread SIMD kernel. The kernel
+  is therefore *decode* bound: each packed byte costs an 8-float LUT load plus
+  an 8-float `x` load for only five useful values, so it leaves most of the
+  load throughput unused. `benchmarks/bench_gemv_roofline.py` measures this
+  directly: a dense f32 FMA (four times the bytes) reaches ~2× the GEMV's MAC
+  rate, and a pure read of the same packed bytes is ~30× faster. A 7B-shaped
+  layer compiled by `velocec` runs at 27.7 GMAC/s (4.3 tok/s for 32 layers).
+  A correct bandwidth roofline on this VM is ~14 tok/s, so the PRD's 15 tok/s
+  target is within reach *if the decode overhead is removed* — it is not a
+  hardware wall, and the honest status is "FAIL today, real headroom".
 * **End-to-end mid-size model** (`benchmarks/bench_midi_lm.py`): a genuine
   275.6M-ternary-parameter decoder (6 layers, d=1536, ffn=6144, V=32000,
   T=1 without KV cache) built with the production packing code, written as a
@@ -141,6 +147,7 @@ the capabilities come from the trained model.
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |
 | `make demo` | tiny-LM inference demo: ternary weights are 89.9% smaller than fp16 (PRD ≥80% target) |
+| `make bench-roofline` | where the trit GEMV's time actually goes: a pure read of the packed bytes, a dense-f32 FMA ceiling, and the shipped kernel, on identical data — shows the kernel is decode-bound (~19% of real peak), not at a memory wall |
 | `make bench-throughput` | real measured throughput vs the PRD targets: trit GEMV GMAC/s, attention GFLOP/s, projected 7B-class tokens/s, memory-bandwidth roofline, footprint and compile-time checks |
 | `make bench-midi` | end-to-end 275.6M-ternary decoder: real `.veloce` weights, mmap'd forward pass, measured tok/s, determinism hash and optional NumPy verification |
 | `velocec model-card FILE.veloce` | prints the capability model card embedded in a `.veloce` export; `make train` and `make bench-midi` both write one |

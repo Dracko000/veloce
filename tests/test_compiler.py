@@ -408,6 +408,50 @@ fn f(x: f32[M, K], w: {wrong}[N, K]) -> f32[M, N] {{
         self.assertEqual(int(out.strip()), expect)
 
 
+class TestBenchmarkMetrics(unittest.TestCase):
+    """Guard the throughput benchmark against the bugs that inflated its claims.
+
+    The published "99% of streaming peak" came from two defects: a scalar
+    1-thread probe compared against a 4-thread kernel, and dividing by T4_MS
+    regardless of which run was fastest.  These tests pin the fixes.
+    """
+
+    def setUp(self):
+        import importlib.util
+        path = os.path.join(ROOT, "benchmarks", "bench_throughput.py")
+        spec = importlib.util.spec_from_file_location("bench_throughput", path)
+        self.bt = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.bt)
+
+    def test_bandwidth_ratio_uses_matching_thread_count(self):
+        """The probe and the kernel must be measured at the same thread count.
+
+        Equality here is the property that was violated: a 1-thread probe vs a
+        4-thread kernel can report a ratio above 100% of "peak".
+        """
+        import inspect
+        src = inspect.getsource(self.bt.bench_membw)
+        self.assertIn("threads", inspect.signature(self.bt.bench_membw).parameters)
+        self.assertIn("num_threads({threads})", src)
+        self.assertIn("schedule(static)", src)
+        # and the caller must feed it the GEMV's own thread count
+        main_src = inspect.getsource(self.bt.main)
+        self.assertIn("bench_membw(args.quick, threads=gemv_threads)", main_src)
+        self.assertIn('gemv_ms = gemv[f"T{gemv_threads}_MS"]', main_src)
+        self.assertIn('gemv[f"T{gemv_threads}_MS"], attn', main_src)
+
+    def test_probe_is_not_a_scalar_byte_sum(self):
+        """The old probe was `for i: acc += a[i]`, which measured a scalar loop.
+
+        A real ceiling has to be at least parallel; assert the probe body reads
+        several bytes per iteration rather than one.
+        """
+        import inspect
+        src = inspect.getsource(self.bt.bench_membw)
+        self.assertIn("a[i+15]", src, "probe should read 16 bytes per step")
+        self.assertNotIn("for (size_t i = 0; i < n; i++) acc += a[i];", src)
+
+
 class TestVeloceFormat(unittest.TestCase):
     def test_roundtrip(self):
         import numpy as np

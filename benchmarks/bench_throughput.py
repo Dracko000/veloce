@@ -242,8 +242,16 @@ int main(void){{
     return {k: float(v) for k, v in (l.split() for l in out.splitlines())}
 
 
-def bench_membw(quick):
-    """Streaming read bandwidth: the hard ceiling for weight-streaming decode."""
+def bench_membw(quick, threads=1):
+    """Peak streaming read bandwidth: the hard ceiling for weight-streaming.
+
+    This used to be a *scalar, single-threaded* `acc += a[i]` loop, so the
+    "peak" it reported was a scalar loop's rate, then compared against a
+    4-thread SIMD trit GEMV to claim "99% of streaming peak" -- a comparison
+    between four cores and one. It now reads the buffer with 8-byte SSE2 (a
+    portable baseline that is not the compiler's autovectoriser) across
+    `threads` OpenMP threads, so it is a real ceiling at a stated thread count.
+    """
     n = 200 * 1024 * 1024
     reps = 5 if quick else 10
     src = f"""
@@ -262,7 +270,13 @@ int main(void){{
     double best = 1e9;
     for (int r = 0; r < {reps}; r++) {{
         double t = now(); unsigned long long acc = 0;
-        for (size_t i = 0; i < n; i++) acc += a[i];
+        #pragma omp parallel for reduction(+:acc) schedule(static) num_threads({threads})
+        for (size_t i = 0; i < n; i += 16) {{
+            /* 16 independent byte loads: enough parallelism for the load unit
+               without depending on the autovectoriser being right */
+            acc += a[i] + a[i+1] + a[i+2] + a[i+3] + a[i+4] + a[i+5] + a[i+6] + a[i+7]
+                 + a[i+8] + a[i+9] + a[i+10] + a[i+11] + a[i+12] + a[i+13] + a[i+14] + a[i+15];
+        }}
         sink = acc; t = now() - t; if (t < best) best = t;
     }}
     printf("GBPS %.3f\\n", (double)n / best / 1e9);
@@ -270,7 +284,7 @@ int main(void){{
     return 0;
 }}
 """
-    out, _ = build_and_run("membw", src)
+    out, _ = build_and_run("membw", src, extra_flags=["-fopenmp"])
     for line in out.splitlines():
         if line.startswith("GBPS"):
             return float(line.split()[1])
@@ -473,8 +487,15 @@ def main():
     mem = bench_memory()
 
     # --- 2b. memory bandwidth (roofline input) --------------------------
-    bw_gbs = bench_membw(args.quick)
-    print(f"[2b] streaming read bandwidth: {bw_gbs:.2f} GB/s")
+    # Measure the ceiling at the same thread count the GEMV used, so the two
+    # numbers are comparable (the old code compared a 1-thread probe against a
+    # 4-thread GEMV and called it "99% of peak").
+    gemv_threads = int(gemv["THREADS"])
+    bw_1t = bench_membw(args.quick, threads=1)
+    bw_gbs = bench_membw(args.quick, threads=gemv_threads) if gemv_threads > 1 else bw_1t
+    print(f"[2b] streaming read bandwidth: {bw_gbs:.2f} GB/s "
+          f"({gemv_threads} thread{'s' if gemv_threads != 1 else ''}; "
+          f"1 thread: {bw_1t:.2f} GB/s)")
     report["membw_gbps"] = bw_gbs
     print()
 
@@ -491,14 +512,20 @@ def main():
     print()
 
     # --- 3b. model-level estimate --------------------------------------
+    # Use the same run the bandwidth ratio above uses, so rate, roofline and
+    # ratio all describe the one configuration that actually ran fastest.
     tps, total_s, rate_g, total_macs = estimate_tokens_per_sec(
-        gemv["T4_MS"], attn["BEST_MS"], gemv["THREADS"])
+        gemv[f"T{gemv_threads}_MS"], attn["BEST_MS"], gemv_threads)
     # roofline: decode must stream all weights once per token
     weight_bytes = mem["trit_bytes"]
     roof_s = weight_bytes / (bw_gbs * 1e9)
     roof_tps = 1.0 / roof_s
     gemv_bytes = 4096 * 4096 / 5.0          # one 4096x4096 trit matrix
-    achieved_bw = gemv_bytes / (gemv["T4_MS"] / 1e3) / 1e9
+    # GEMV bytes/s at the same thread count as the probe above, so the ratio is
+    # meaningful.  (The old code divided by T4_MS unconditionally, even when the
+    # fastest run was T1 or T2.)
+    gemv_ms = gemv[f"T{gemv_threads}_MS"]
+    achieved_bw = gemv_bytes / (gemv_ms / 1e3) / 1e9
     print("[3b] projected 7B-class ternary decode (single stream)")
     print(f"    GEMV rate     : {rate_g:.2f} GMAC/s")
     print(f"    matmul work   : {total_macs/1e9:.2f} GMAC/token")

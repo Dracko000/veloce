@@ -28,7 +28,7 @@ VENV_PY  := $(VENV)/bin/python
 VENV_REQ := requirements-test.txt
 VENV_STAMP := $(VENV)/.requirements.stamp
 
-.PHONY: all demo test examples kv train bench bench-midi bench-midi-05b \
+.PHONY: all demo test examples kv train bench bench-midi bench-midi-05b bench-roofline \
         model-module plan bench-throughput venv doctor clean
 
 all: $(VDIR)/transformer_block.c $(VDIR)/tiny_lm.c $(VDIR)/tiny_lm_cls.c $(VDIR)/hello.c
@@ -79,6 +79,9 @@ bench: $(VENV_STAMP)
 
 plan:
 	@./velocec check examples/transformer_block.vel
+
+bench-roofline: $(VENV_STAMP)
+	@$(VENV_PY) benchmarks/bench_gemv_roofline.py
 
 bench-throughput: bench
 

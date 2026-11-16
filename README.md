@@ -127,7 +127,7 @@ kernels. Representative result:
 | Metric | Measured | PRD target |
 |--------|----------|------------|
 | trit GEMV 4096×4096 (1 thread → 4 threads) | 7.6 → 15.5–19.4 GMAC/s (**2.1–2.5× speedup**) | — |
-| trit GEMV read bandwidth | 3.1–3.9 GB/s = **81–97% of streaming peak** | — |
+| trit GEMV read bandwidth | 3.6 GB/s = **19% of the host's 18.7 GB/s peak** (decode-bound, see below) | — |
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
 | **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **20–22 tok/s** (1 thread, 45–50 ms median; 25–26 tok/s best-of-21) | — |
 | same model, 2 threads | 28–36 tok/s (28–36 ms median; host-load dependent) | — |
@@ -137,11 +137,18 @@ kernels. Representative result:
 | compile time | ~4 ms | < 2 s ✅ |
 | heap allocation in generated C | none | zero ✅ |
 
-The 7B-class speed gap is dominated by this VM's streaming memory bandwidth
-(3.8 GB/s measured): such a model must stream ~1.3 GB of weights per token,
-capping any implementation here at ~2.9 tok/s. The benchmark prints that
-roofline explicitly so kernel improvements are not confused with hardware
-limits.
+The 7B-class speed gap is NOT purely memory bandwidth, and the earlier claim
+that the kernel sat at the bandwidth roofline was measurement error. The old
+"streaming peak" was a scalar single-threaded byte-sum loop; the real ceiling
+this VM can stream is **18.7 GB/s at 4 threads** (5.4 GB/s at 1). Against
+that, the trit GEMV achieves **3.6 GB/s — 19% of peak**, so it is *decode*
+bound, not bandwidth bound: every packed byte needs an 8-float LUT load plus
+an 8-float `x` load for only 5 useful values, so it leaves well over half the
+load throughput on the floor. `benchmarks/bench_gemv_roofline.py` measures
+this directly (a dense f32 FMA runs ~2x the GEMV's MAC rate while reading 4x
+the bytes). Closing that gap is real optimization headroom, not a hardware
+wall; the ~14 tok/s roofline printed above is only reachable once the decode
+stops being the bottleneck.
 
 The mid-size number is a *real* end-to-end run, not a projection:
 `benchmarks/bench_midi_lm.py` generates a 275.6M-ternary-parameter decoder with

@@ -41,25 +41,52 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-Nothing queued. The next run should pick the highest-value item itself and add
-it here first, with the evidence that justifies it.
+### 1. Trit GEMV is decode-bound: ~19% of real peak, so there is headroom
 
-Candidates, in rough priority order:
+The docs used to say the kernel sat at the bandwidth roofline. That was a
+measurement error: the "streaming peak" was a scalar single-threaded loop.
+Real peak on this VM is **18.7 GB/s at 4 threads**; the GEMV does **3.6 GB/s,
+19%**. `make bench-roofline` shows a dense f32 FMA reaching ~2x the GEMV's MAC
+rate while reading 4x the bytes, and a pure read of the same packed bytes being
+~30x faster. So the kernel is limited by the decode, not memory.
 
-1. **Close the 7B-class speed gap honestly.** `make bench` fails the PRD's
-   15 tok/s target (3.27 projected, hardware ceiling 2.68 on this 4-vCPU VM),
-   so the target is unreachable by any implementation here. Either state that
-   in `PRD.md`/`README.md` as a measured hardware bound, or find a real win:
-   the measured gap between the model and the streaming-read probe is still
-   12-50%, which suggests the kernel is not yet at the bandwidth roofline.
-2. **`benchmarks/midi_lm_results.json` has no cached block.** The cached
-   numbers (27.84 tok/s, 32 tokens, 64 slots) are only in the report and the
-   log, not in the committed artefact. Add them so the JSON tells the whole
-   story.
-3. **Attention masking for 2-D masks** is validated but only exercised with a
-   1-D mask; a per-row mask (e.g. per-head causal) deserves a test.
+Every output neuron reloads the whole `x` vector (an 8-float AVX load per
+packed byte, caching 32 bytes for 5 useful values), and the LUT decode costs
+one 32-byte load + one FMA per packed byte. The obvious win is to process
+several output rows per pass so the `x` loads are amortised.
+
+**Blocker that stopped it:** trit rows are *not byte-aligned* — row j starts at
+flat trit index `j*K`, byte `j*K/5`, slot `(j*K)%5` — so `w + j*rowbytes`
+is the wrong pointer for row j, which is why a naive multi-row kernel
+segfaulted. Any multi-row kernel has to carry the flat element index and use
+`w[e/5]` / slot `e%5`, or the on-disk format and `.veloce` layout must change
+(padding rows to byte boundaries costs ≤4 bits per row and would make rows
+individually addressable). Decide which, then implement and measure.
+
+Target: beat 19% of peak. Anything that does should be visible in
+`make bench-midi` tok/s and in `make bench-roofline`'s kernel/ceiling ratio.
+
+### 2. `benchmarks/midi_lm_results.json` has no cached block
+
+The cached numbers (27.84 tok/s, 32 tokens, 64 slots) live only in reports and
+logs, not the committed artefact. Add them so the JSON tells the whole story.
+
+### 3. Attention masking for 2-D masks
+
+`softmax(x, mask)` validates 2-D masks but only 1-D masks are exercised. A
+per-row mask (per-head causal) deserves a test.
 
 ## Done (most recent first)
+
+* Corrected the bandwidth claims and fixed the benchmark that produced them.
+  `bench_membw` was a scalar 1-thread loop compared against a 4-thread SIMD
+  kernel, so "99% of streaming peak" compared four cores to one; it also
+  divided by `T4_MS` unconditionally. Probe now runs at the same thread count
+  with a real read loop, and the ratio is taken at the matching thread count.
+  Honest number: GEMV = 19% of the real 18.7 GB/s peak, i.e. decode-bound.
+  New `make bench-roofline` quantifies it: kernel/ceiling = 0.36-0.46x while
+  reading 4x fewer bytes than a dense FMA.
+
 
 * Benchmark artefacts regenerated and stamped with `measured_at` (UTC):
   `benchmarks/results.json` (2026-11-16T01:36Z) and
