@@ -41,19 +41,41 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. Attention masking as a first-class builtin
+Nothing queued. The next run should pick the highest-value item itself and add
+it here first, with the evidence that justifies it.
 
-Masking currently works by adding a `f32[CT]` bias of `-1e30` to the scores
-(`veloce.lmmodule.MASK_HIDDEN`). That is a convention, not a language feature;
-a `mask` argument on `softmax` would be safer than relying on `-1e30` not
-overflowing.
+Candidates, in rough priority order:
 
-### 2. Stale benchmark artefacts
-
-`benchmarks/results.json` holds numbers from an older host state; re-run
-`make bench` and commit the fresh file, or state the date in the file.
+1. **Close the 7B-class speed gap honestly.** `make bench` fails the PRD's
+   15 tok/s target (3.27 projected, hardware ceiling 2.68 on this 4-vCPU VM),
+   so the target is unreachable by any implementation here. Either state that
+   in `PRD.md`/`README.md` as a measured hardware bound, or find a real win:
+   the measured gap between the model and the streaming-read probe is still
+   12-50%, which suggests the kernel is not yet at the bandwidth roofline.
+2. **`benchmarks/midi_lm_results.json` has no cached block.** The cached
+   numbers (27.84 tok/s, 32 tokens, 64 slots) are only in the report and the
+   log, not in the committed artefact. Add them so the JSON tells the whole
+   story.
+3. **Attention masking for 2-D masks** is validated but only exercised with a
+   1-D mask; a per-row mask (e.g. per-head causal) deserves a test.
 
 ## Done (most recent first)
+
+* Benchmark artefacts regenerated and stamped with `measured_at` (UTC):
+  `benchmarks/results.json` (2026-11-16T01:36Z) and
+  `benchmarks/midi_lm_results.json` (2026-11-16T01:37Z), so a number can no
+  longer be mistaken for a different host state. Current honest picture: 2.80x
+  parallel speedup, 90% smaller than fp16, zero heap allocation, 3 ms compile,
+  and the 7B-class 15 tok/s target still FAILING at 3.27 tok/s projected with
+  a measured 2.68 tok/s hardware ceiling.
+
+* `softmax(x, mask)` builtin: an `i32` mask excludes hidden entries from the
+  row max and normaliser, so a hidden entry contributes exactly zero whatever
+  it holds (tested with `NaN` and `±1e30` in the hidden columns). Replaces the
+  `-1e30` score bias everywhere, including `veloce/lmmodule.py` and the cached
+  benchmark driver. Measured after the switch: 32 tokens through a 64-slot
+  cache at 27.84 tok/s, determinism PASS, verify rel err 1.16e-6. Suites now
+  33 e2e + 40 compiler.
 
 * **The "two-layer cached decode diverges at ~1e30" blocker was not a compiler
   bug.** The parked test's C driver built the `forward_cached` argument list by
