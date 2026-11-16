@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="200" viewBox="0 0 660 200" role="img" aria-label="Veloce">
+  <rect width="660" height="200" fill="#ffffff"/>
+  <g transform="translate(38,40.5)"><g transform="translate(0,20.671)"><path d="M 8.70 13.34 L 58.00 61.32 L 107.30 13.34" fill="none" stroke="#ffb020" stroke-width="14.50" stroke-linecap="butt" stroke-linejoin="miter"/></g></g>
+  <text x="180" y="106" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="56" font-weight="500" letter-spacing="23.5" fill="#0d1117">veloce</text>
+  <text x="183" y="140" font-family="DejaVu Sans Mono, monospace" font-size="14.5" letter-spacing="3.4" fill="#57606a">LOW-BIT AOT COMPILER</text>
+</svg>

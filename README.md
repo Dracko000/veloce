@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Veloce" width="420">
+</p>
+
 # Veloce
 
 A **low-bit, zero-allocation programming language and AOT compiler for LLM
@@ -47,6 +51,26 @@ make bench-throughput
 # Print the capability model card embedded in a .veloce export
 ./velocec model-card examples/tiny_lm.veloce
 ```
+
+## Brand assets
+
+`assets/` holds the mark, the lockup and the icon set. Everything there is
+generated — edit `assets/make_logo.py` and re-run it, never the SVGs by hand:
+
+```bash
+python3 assets/make_logo.py     # writes all of assets/, stdlib only
+```
+
+* `logo.svg` / `logo-light.svg` — lockup (mark + wordmark + tagline)
+* `logo-mark.svg` / `logo-mark-light.svg` — mark alone, for avatars
+* `logo-wordmark.svg` — wordmark alone
+* `logo.png` (1024²), `logo-256.png`, `favicon.ico` (16–64 px)
+
+The mark is a bold amber V — "veloce" — on the project's near-black slate.
+A five-tick "one packed byte" motif was tried twice (below the vertex, then
+inside its counter) and dropped both times: at every size it read as a separate
+UI progress indicator or collided with the stroke, which made the mark weaker,
+not richer.
 
 Requirements: **Python 3.10+** and a **C11 compiler** (`cc`/`gcc`). The
 compiler itself is stdlib-only; the test/example targets use NumPy as an
