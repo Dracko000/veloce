@@ -126,6 +126,7 @@ continue
 | `silu(x)` / `relu(x)` | `[..] -> [..]` | activation |
 | `softmax(x)` | `[T,N] -> [T,N]` | row-wise softmax |
 | `softmax(x, mask)` | `[T,N], i32[N] -> [T,N]` | masked row softmax: `mask[i] == 0` hides column `i` (probability exactly 0, excluded from the max and normaliser) |
+| `softmax(x, mask)` | `[T,N], i32[T,N] -> [T,N]` | per-row mask: mask row `r` applies to scores row `r` (per-head causal), so different rows may hide different columns. The mask must be `i32`; other integer dtypes are rejected rather than reinterpreted |
 | `transpose(x)` | `[R,C] -> [C,R]` | |
 | `rope(x)` | `[T,D] -> [T,D]` | rotary position embedding |
 | `embedding(table, idx)` | `[V,D], i32 -> [1,D]` | single token lookup |

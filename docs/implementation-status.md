@@ -82,6 +82,13 @@ real module (see `test_erd_introspection`).
   a stale cache row, `NaN` or `±1e30` cannot reach the result
   (`test_masked_softmax_builtin` poisons the hidden columns with exactly
   those values). A fully masked row returns zeros, not `NaN`.
+  A 1-D mask is broadcast to every row; a 2-D `i32[T,N]` mask is *per row*
+  (mask row `r` for scores row `r`, i.e. a per-head causal mask), which the
+  lowering selects by mask rank — reading a 2-D mask as 1-D used to apply
+  row 0 to every row and produce a plausible but wrong distribution. The
+  mask dtype is `i32` only; `i8`/`i64`/`i2` are rejected instead of being
+  reinterpreted as 32-bit words (`test_masked_softmax_per_row_mask`,
+  `test_softmax_mask_rejects_bad_shape_and_dtype`).
   `test_cached_decode_attention_mask` decodes four tokens through a 1-, 2- and
   3-layer cached decoder and checks the result against a strictly causal
   float64 reference.

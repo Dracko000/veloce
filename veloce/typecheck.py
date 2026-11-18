@@ -706,6 +706,9 @@ class Checker:
         can therefore hold any value (a stale cache row, a garbage slot)
         without affecting the result, which the old `score + -1e30` trick
         could not guarantee.
+
+        A 1-D mask `i32[N]` is broadcast to every row; a 2-D mask `i32[T, N]`
+        supplies one mask per row, which is what a per-head causal mask needs.
         """
         x = self._tensor_arg(e, 0, "softmax", e)
         if len(e.args) > 1:
@@ -715,9 +718,12 @@ class Checker:
             if x.rank != 2:
                 raise TypeError_("masked softmax requires a 2-D scores tensor",
                                  e.line, e.col)
-            if m.dtype.name not in ("i32", "i64", "i8", "u8", "i2", "i4"):
+            # The runtime reads the mask as 32-bit words; accepting i64/i8/
+            # i2 and then passing the pointer through would reinterpret the
+            # bytes and hide garbage.  One dtype, checked once.
+            if m.dtype.name != "i32":
                 raise TypeError_(
-                    f"softmax mask must be an integer tensor (0 = hidden), got {m.dtype}",
+                    f"softmax mask must be i32 (0 = hidden), got {m.dtype}",
                     e.line, e.col)
             hidden_dim = x.dims[-1]
             if m.rank == 1:
@@ -727,6 +733,12 @@ class Checker:
                         f"softmax mask length {m.dims[0]} does not match the "
                         f"last dimension {hidden_dim}", e.line, e.col)
             elif m.rank == 2:
+                rows = x.dims[0]
+                if not (m.dims[0].is_symbol or rows.is_symbol
+                        or m.dims[0].value == rows.value):
+                    raise TypeError_(
+                        f"softmax mask has {m.dims[0]} rows but the scores "
+                        f"have {rows}", e.line, e.col)
                 if not (m.dims[1].is_symbol or hidden_dim.is_symbol
                         or m.dims[1].value == hidden_dim.value):
                     raise TypeError_(

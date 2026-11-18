@@ -1577,11 +1577,101 @@ int main(void) {{
     assert np.array_equal(allhid, np.zeros(C, dtype=allhid.dtype)), allhid
 
 
+def test_masked_softmax_per_row_mask():
+    """A 2-D mask is per row, not a silent broadcast of mask row 0.
+
+    The typechecker has always accepted `i32[T, C]`, but the runtime read
+    `mask[i]` for `i < C`, so every row saw row 0 of the mask.  A per-head
+    causal mask therefore produced a plausible but wrong distribution with no
+    diagnostic.  The mask below has a different visible pattern per row, so
+    broadcasting row 0 cannot pass, and the hidden entries are poisoned with
+    values that would leak if they were included in the max or the sum.
+    """
+    import veloce
+    T, C = 3, 4
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((T, C)).astype(np.float32)
+    mask = np.array([[1, 0, 0, 0],
+                     [1, 1, 0, 0],
+                     [1, 1, 1, 1]], dtype=np.int32)
+    x[0, 1] = 1e30
+    x[0, 3] = np.nan
+    x[1, 2] = 1e30
+    x[2, 3] = -1e30
+
+    src = f"""module smr
+dim T = {T}
+dim C = {C}
+fn f(x: f32[T, C], m: i32[T, C]) -> f32[T, C] {{
+    return softmax(x, m)
+}}
+"""
+    c = veloce.compile_source(src, module_name="smr").c_source
+    assert "veloce_softmax_masked_rows(" in c, c
+    assert "veloce_softmax_masked(" not in c, c
+
+    driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+float *veloce_f(float*,int32_t*);
+int main(void) {{
+    float x[{T*C}] = {{ {", ".join(cf(v) for v in x.flatten())} }};
+    int32_t m[{T*C}] = {{ {", ".join(str(int(v)) for v in mask.flatten())} }};
+    float *o = veloce_f(x, m);
+    for (int i = 0; i < {T*C}; i++) printf("%a\\n", o[i]);
+    return 0;
+}}
+"""
+    outs = {}
+    for pool in (0, 1, 2):
+        rc, out, err, _ = _threads_build(src, driver, pool, 4, name=f"smrow{pool}")
+        assert rc == 0, err
+        outs[pool] = out
+    assert outs[0] == outs[1] == outs[2], "per-row masked softmax differs across threads"
+
+    got = np.array([float.fromhex(v) for v in outs[0].split()]).reshape(T, C)
+    assert not np.any(got[~mask.astype(bool)]), got
+    ref = np.zeros((T, C))
+    for r in range(T):
+        vis = mask[r].astype(bool)
+        xs = x[r][vis].astype(np.float64)
+        e = np.exp(xs - xs.max())
+        ref[r][vis] = e / e.sum()
+    assert np.abs(got - ref).max() < 1e-6, (got, ref)
+    assert np.allclose(got.sum(axis=1), 1.0, atol=1e-6), got.sum(axis=1)
+
+
+def test_softmax_mask_rejects_bad_shape_and_dtype():
+    """A 2-D mask must match the row count, and only i32 is accepted.
+
+    Both were silently accepted before: a short i32[2, C] mask would be read
+    past its end, and an i8[T, C] mask would be reinterpreted as 32-bit
+    words, so neither could be trusted to mean what it said.
+    """
+    import veloce
+    cases = [("i32", 2, "rows"), ("i8", 3, "i32")]
+    for ty, rows, want in cases:
+        src = f"""module t2
+dim T = 3
+dim C = 4
+dim M = {rows}
+fn f(x: f32[T, C], m: {ty}[M, C]) -> f32[T, C] {{
+    return softmax(x, m)
+}}
+"""
+        try:
+            veloce.compile_source(src, module_name="t2")
+        except (veloce.TypeError_, veloce.SemanticError) as e:
+            assert want in str(e), e
+        else:
+            raise AssertionError(f"softmax accepted a {ty}[{rows}, C] mask")
+
+
 def test_masked_softmax_rejects_bad_mask():
     """A mask must be integer and match the last dimension."""
     import veloce
     for mask_ty, mask_dim in (("f32", 4), ("i32", 3)):
-        src = f"""module t
+        src = f"""module t3
 dim C = 4
 dim M = {mask_dim}
 fn f(x: f32[2, C], m: {mask_ty}[M]) -> f32[2, C] {{
@@ -1589,9 +1679,11 @@ fn f(x: f32[2, C], m: {mask_ty}[M]) -> f32[2, C] {{
 }}
 """
         with np.testing.assert_raises(Exception):
+            veloce.compile_source(src, module_name="t3")
+
+
+        with np.testing.assert_raises(Exception):
             veloce.compile_source(src, module_name="t")
-
-
 def _rmsnorm64(x, w):
     inv = 1.0 / np.sqrt(float((x * x).sum()) / x.shape[0] + 1e-5)
     return x * inv * w.astype(np.float64)

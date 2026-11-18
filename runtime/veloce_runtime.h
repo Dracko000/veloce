@@ -1862,37 +1862,42 @@ static inline void veloce_softmax(float *out, const float *x, size_t total, size
     veloce_parallel_for_sized(total / cols, cols * 2 * sizeof(float), veloce_softmax_row, &c);
 }
 
-/* Masked softmax: an integer mask broadcast across rows hides entries.
+/* Masked softmax: an integer mask hides entries.
  *   mask[i] != 0  -> entry i participates
  *   mask[i] == 0  -> entry i gets probability exactly 0
  * The max and the sum are taken over visible entries only, so a hidden entry
- * can never reach the result no matter what it contains -- there is no sentinel
+ * can never reach the result no matter what it contains - there is no sentinel
  * magnitude to overflow, which is what the old `score + -1e30` convention
  * relied on.  A row with nothing visible produces all zeros (not NaN), since
  * a fully-masked row has no distribution to normalise.
  * Accumulation stays in index order per row, so results are bit-identical at
- * every thread count. */
-typedef struct { float *out; const float *x; const int32_t *mask; size_t cols; }
-        veloce_softmax_mask_ctx;
-static inline void veloce_softmax_mask_row(void *vctx, size_t r) {
-    const veloce_softmax_mask_ctx *c = (const veloce_softmax_mask_ctx *)vctx;
-    const float *xr = c->x + r * c->cols;
-    float *orow = c->out + r * c->cols;
+ * every thread count.
+ *
+ * Two entry points, one row body:
+ *   veloce_softmax_masked      1-D mask `i32[C]`, broadcast to every row
+ *   veloce_softmax_masked_rows 2-D mask `i32[T, C]`, one mask row per scores
+ *                              row (per-head causal masks)
+ * The 2-D form exists because a broadcast read of a per-row mask applies mask
+ * row 0 to every row: the builtin used to accept a 2-D mask and read it as
+ * 1-D, producing plausible but wrong probabilities instead of an error.
+ */
+static inline void veloce_softmax_mask_apply(float *orow, const float *xr,
+                                             const int32_t *mr, size_t cols) {
     float mx = -INFINITY;
     int any = 0;
-    for (size_t i = 0; i < c->cols; i++) {
-        if (c->mask[i]) {
+    for (size_t i = 0; i < cols; i++) {
+        if (mr[i]) {
             if (xr[i] > mx) mx = xr[i];
             any = 1;
         }
     }
     if (!any) {
-        for (size_t i = 0; i < c->cols; i++) orow[i] = 0.0f;
+        for (size_t i = 0; i < cols; i++) orow[i] = 0.0f;
         return;
     }
     float sum = 0.0f;
-    for (size_t i = 0; i < c->cols; i++) {
-        if (c->mask[i]) {
+    for (size_t i = 0; i < cols; i++) {
+        if (mr[i]) {
             float e = expf(xr[i] - mx);
             orow[i] = e;
             sum += e;
@@ -1901,11 +1906,25 @@ static inline void veloce_softmax_mask_row(void *vctx, size_t r) {
         }
     }
     const float inv = 1.0f / sum;
-    for (size_t i = 0; i < c->cols; i++) orow[i] *= inv;
+    for (size_t i = 0; i < cols; i++) orow[i] *= inv;
+}
+typedef struct { float *out; const float *x; const int32_t *mask; size_t cols; int per_row; }
+        veloce_softmax_mask_ctx;
+static inline void veloce_softmax_mask_row(void *vctx, size_t r) {
+    const veloce_softmax_mask_ctx *c = (const veloce_softmax_mask_ctx *)vctx;
+    const float *xr = c->x + r * c->cols;
+    const int32_t *mr = c->per_row ? c->mask + r * c->cols : c->mask;
+    veloce_softmax_mask_apply(c->out + r * c->cols, xr, mr, c->cols);
 }
 static inline void veloce_softmax_masked(float *out, const float *x, const int32_t *mask,
                                          size_t total, size_t cols) {
-    veloce_softmax_mask_ctx c = { out, x, mask, cols };
+    veloce_softmax_mask_ctx c = { out, x, mask, cols, 0 };
+    veloce_parallel_for_sized(total / cols, cols * 2 * sizeof(float),
+                              veloce_softmax_mask_row, &c);
+}
+static inline void veloce_softmax_masked_rows(float *out, const float *x, const int32_t *mask,
+                                              size_t total, size_t cols) {
+    veloce_softmax_mask_ctx c = { out, x, mask, cols, 1 };
     veloce_parallel_for_sized(total / cols, cols * 2 * sizeof(float),
                               veloce_softmax_mask_row, &c);
 }
