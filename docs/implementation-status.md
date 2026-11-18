@@ -162,7 +162,7 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 28 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel and an `-ffast-math` SiLU saturation regression) + 37 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 36 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel, a masked-softmax per-row-mask check and an `-ffast-math` SiLU saturation regression) + 44 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |

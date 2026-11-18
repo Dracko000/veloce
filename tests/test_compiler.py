@@ -452,7 +452,44 @@ class TestBenchmarkMetrics(unittest.TestCase):
         self.assertNotIn("for (size_t i = 0; i < n; i++) acc += a[i];", src)
 
 
+class TestBenchmarkArtefact(unittest.TestCase):
+    """The committed midi_lm artefact must carry the cached-decode block.
+
+    It did not: the numbers existed only in reports while the JSON said
+    "cached": null, so the file could not answer what a KV-cache decode
+    costs.  The regeneration target now passes --cached and this test keeps
+    the artefact and the target from drifting apart again.
+    """
+
+    def setUp(self):
+        import json
+        with open(os.path.join(ROOT, "benchmarks", "midi_lm_results.json")) as f:
+            self.art = json.load(f)
+
+    def test_cached_block_present(self):
+        cached = self.art.get("cached")
+        self.assertIsInstance(cached, dict, "midi_lm_results.json has no cached block")
+        self.assertEqual(cached["slots"], 64)
+        self.assertGreaterEqual(cached["tokens"], 2)
+        self.assertGreater(cached["best_tok_s"], 0.0)
+        self.assertTrue(cached["deterministic"])
+        self.assertTrue(cached["verify"]["pass"])
+        self.assertLess(cached["verify"]["rel_err"], 2e-2)
+        for run in cached["runs"]:
+            self.assertIn("per_token_ms", run)
+            self.assertEqual(run["det"], 1)
+
+    def test_artefact_is_dated_and_regenerated_with_cached(self):
+        """An undated file invites stale comparisons; the target must ask."""
+        self.assertIn("measured_at", self.art)
+        with open(os.path.join(ROOT, "Makefile")) as f:
+            mk = f.read()
+        target = mk.split("bench-midi:", 1)[1].split("#", 1)[0]
+        self.assertIn("--cached", target, "make bench-midi no longer records the cache run")
+
+
 class TestVeloceFormat(unittest.TestCase):
+
     def test_roundtrip(self):
         import numpy as np
         w = np.array([[-1, 0, 1], [1, 1, -1]], dtype=np.int8)

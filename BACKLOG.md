@@ -41,17 +41,44 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. `benchmarks/midi_lm_results.json` has no cached block
+### 1. The cached decoder still passes a 1-D mask
 
-The cached numbers (27.84 tok/s, 32 tokens, 64 slots) live only in reports and
-logs, not the committed artefact. Add them so the JSON tells the whole story.
+`veloce/lmmodule.py` renders `mask: i32[CT]` and passes it to
+`softmax(scores, mask)`, so the per-row path is unit-tested but never reached
+end to end. A per-head cached decoder needs `i32[H, CT]` (or `i32[1, CT]` with
+a zeroed `head + 1` slot), which is now expressible: `make bench-midi` with a
+2-D mask should still verify at rel err ~1.5e-6.
 
-### 2. Attention masking for 2-D masks
+### 2. The 7B-class target is still failing
 
-`softmax(x, mask)` validates 2-D masks but only 1-D masks are exercised. A
-per-row mask (per-head causal) deserves a test.
+`benchmarks/results.json` projects 3.04-3.27 tok/s for the 7B-class shape
+against a PRD target of 15 tok/s, with a measured 2.68 tok/s hardware ceiling
+from the same-run probe. The GEMV is decode-bound, not bandwidth-bound (22-31%
+of the streaming peak after the phase-grouped kernel).
 
 ## Done (most recent first)
+
+* **`softmax(x, mask)` with a 2-D mask was a silent miscompile.** The
+  typechecker accepted `i32[T, C]` (checking only the width) while the runtime
+  read `mask[i]` for `i < C`, so every row saw mask row 0: a per-head causal
+  mask produced a plausible but wrong distribution with no diagnostic. The
+  lowering now picks `veloce_softmax_masked_rows` for a 2-D mask and keeps the
+  broadcast `veloce_softmax_masked` for a 1-D one, both over one shared row
+  body. A short 2-D mask (row count not equal to the scores rows) and any
+  non-i32 mask are now compile errors; `i64`/`i8`/`i2` used to be passed
+  straight through as 32-bit words. New `test_masked_softmax_per_row_mask`
+  uses a mask whose rows differ and poisons the hidden entries with
+  `NaN`/`+-1e30`; forcing the broadcast kernel makes it fail, so the test has
+  teeth. Suites 34 -> 36 e2e, 42 -> 44 compiler.
+
+* **`benchmarks/midi_lm_results.json` now carries the cached block.** The
+  committed artefact said `"cached": null` because `make bench-midi` never
+  passed `--cached`; the numbers existed only in reports. The target now runs
+  `--verify --cached`, and `TestBenchmarkArtefact` fails if the JSON loses the
+  block or if the Makefile target stops asking for it. Measured on the
+  regenerated artefact (2026-11-18): eager 25.68 tok/s, cached decode
+  **22.21 tok/s (45.02 ms/token, 32 tokens, 64 slots)**, determinism PASS,
+  cached verify rel err 1.51e-6 PASS, 0.86x the eager path.
 
 * **Trit GEMV: four output rows per pass, grouped by byte phase.** Flat
   base-3 packing puts row j at byte `(j*K)/5`, slot `(j*K)%5`, so rows only

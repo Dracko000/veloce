@@ -85,8 +85,12 @@ bench-roofline: $(VENV_STAMP)
 
 bench-throughput: bench
 
+# --cached is part of the committed run: the KV-cache block is how the cache
+# path is judged, and an artefact with "cached": null cannot answer what
+# cached decode costs (which is exactly how it went missing before).
 bench-midi: $(VENV_STAMP)
-	@$(VENV_PY) benchmarks/bench_midi_lm.py --verify --json benchmarks/midi_lm_results.json
+	@$(VENV_PY) benchmarks/bench_midi_lm.py --verify --cached \
+		--json benchmarks/midi_lm_results.json
 
 # Same network, the 0.5B-shaped config.  This is a --config invocation, not a
 # second hand-maintained .vel file: veloce/lmmodule.py renders the module for

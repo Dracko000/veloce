@@ -171,15 +171,22 @@ keeps in sync), compiles it and times the generated C against the mmap'd file.
 0.5B-shaped network from the same command; `make bench-midi-05b` does it. On
 one thread the model sustains ~7.4 GMAC/s — the same rate as the standalone
 kernel — so it runs at the kernel's compute roofline, and streams 55 MB of
-packed trits per token at ~1.30 GB/s. Multi-thread scaling is limited by this
-shared VM (load average ~2.7 on 4 vCPUs); 2 threads help, 4 usually hurt.
+packed trits per token at ~1.42 GB/s (25.7 tok/s single-threaded on a quiet
+host). Decoding 32 tokens through a 64-slot per-layer KV cache runs at
+22.2 tok/s (45.0 ms/token, 0.86× the eager path) with a 1.5e-6 relative error
+against the NumPy reference. Multi-thread scaling is limited by this shared
+VM (load average ~1-2.7 on 4 vCPUs); 2 threads help, 4 usually hurt.
 
 The VM is shared, so numbers vary run to run; every benchmark reports medians
 and best-of-N, plus a same-run streaming-bandwidth probe so a tok/s figure can
-be read against what the host can actually deliver. `benchmarks/results.json`
-and `benchmarks/midi_lm_results.json` hold the last full runs; both are
-stamped with `measured_at` (UTC) and the CPU they were taken on, because a
-figure is only comparable against the host state that produced it.
+be read against what the host can actually deliver.
+
+`benchmarks/results.json` and `benchmarks/midi_lm_results.json` hold the last
+full runs; the midi_lm file carries the eager *and* cached (KV-cache) numbers
+in one place. All are stamped with `measured_at` (UTC) and the CPU they were
+taken on, because a figure is only comparable against the host state that
+produced it. `make bench-midi` regenerates the midi_lm artefact with
+`--cached`, so the cache block cannot go missing again.
 
 ## Serving & export scope
 

@@ -14,6 +14,9 @@ What is measured
 * the same binary at VELOCE_THREADS=1/2/4 (FR-4.2: bit-exact across counts)
 * bytes streamed per token vs. the file's packed weight bytes
 * optional NumPy reference check (``--verify``) of the produced logits
+* the same model decoding N tokens through a per-layer KV cache (``--cached``,
+  64 slots / 32 tokens by default); ``make bench-midi`` always passes it so the
+  committed JSON carries both the eager and the cached numbers
 
 Usage
 -----
@@ -22,6 +25,7 @@ Usage
     python3 benchmarks/bench_midi_lm.py --rebuild        # regenerate weights
     python3 benchmarks/bench_midi_lm.py --verify         # NumPy cross-check
     python3 benchmarks/bench_midi_lm.py --json out.json
+    python3 benchmarks/bench_midi_lm.py --cached        # + KV-cache decode
     python3 benchmarks/bench_midi_lm.py --config D=2048,F=5632,layers=7
 
 ``--config`` takes ``key=value`` pairs (``V``, ``D``, ``F``, ``layers``,
