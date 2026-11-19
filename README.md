@@ -132,7 +132,7 @@ kernels. Representative result:
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
 | **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **23.6 tok/s** (1 thread, 42.3 ms median; 25.9 tok/s best) | — |
 | same model, 2 threads | 28–36 tok/s (28–36 ms median; host-load dependent) | — |
-| same model, **KV-cached** decode (32 tokens, 64 slots/layer) | **22.3 tok/s** (44.8 ms/token, 0.75× eager, verify rel err 1.2e-6) | — |
+| same model, **KV-cached** decode (32 tokens, 64 slots/layer, 2 tokens/call) | **25.6 tok/s** (39.0 ms/token, 0.99× eager, verify rel err 1.3e-6) | — |
 | projected 7B-class decode | **~2.4–3.0 tok/s** (compiled layer: 3.3–4.3 tok/s) | ≥ 15 tok/s (**5–6× short**) |
 | weight footprint (7B-class) | 1.3 GB vs 13.2 GB fp16 (90% saved) | ≥ 80% smaller ✅ |
 | compile time | ~4 ms | < 2 s ✅ |
@@ -173,8 +173,12 @@ one thread the model sustains ~7.4 GMAC/s — the same rate as the standalone
 kernel — so it runs at the kernel's compute roofline, and streams 55 MB of
 packed trits per token at ~1.42 GB/s (25.7 tok/s single-threaded on a quiet
 host). Decoding 32 tokens through a 64-slot per-layer KV cache runs at
-22.2 tok/s (45.0 ms/token, 0.86× the eager path) with a 1.5e-6 relative error
-against the NumPy reference. Multi-thread scaling is limited by this shared
+25.6 tok/s (39.0 ms/token, 0.99× the eager path) with a 1.3e-6 relative error
+against the NumPy reference. The cached driver decodes **two tokens per call**,
+so the attention mask carries one row per query row (`i32[T, CT]`) and
+different rows hide different slots -- a mask read as a single broadcast row
+would change the logits. Four tokens per call measured 24.9 tok/s, i.e. no
+further gain. Multi-thread scaling is limited by this shared
 VM (load average ~1-2.7 on 4 vCPUs); 2 threads help, 4 usually hurt.
 
 The VM is shared, so numbers vary run to run; every benchmark reports medians
@@ -186,7 +190,9 @@ full runs; the midi_lm file carries the eager *and* cached (KV-cache) numbers
 in one place. All are stamped with `measured_at` (UTC) and the CPU they were
 taken on, because a figure is only comparable against the host state that
 produced it. `make bench-midi` regenerates the midi_lm artefact with
-`--cached`, so the cache block cannot go missing again.
+`--cached --cached-chunk 2`, so the cache block cannot go missing again and
+the recorded decode goes through the per-row mask kernel rather than the
+broadcast one.
 
 ## Serving & export scope
 

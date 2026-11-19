@@ -90,7 +90,7 @@ bench-throughput: bench
 # cached decode costs (which is exactly how it went missing before).
 bench-midi: $(VENV_STAMP)
 	@$(VENV_PY) benchmarks/bench_midi_lm.py --verify --cached \
-		--json benchmarks/midi_lm_results.json
+		--cached-chunk 2 --json benchmarks/midi_lm_results.json
 
 # Same network, the 0.5B-shaped config.  This is a --config invocation, not a
 # second hand-maintained .vel file: veloce/lmmodule.py renders the module for

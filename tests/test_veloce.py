@@ -1228,7 +1228,7 @@ int main(void) {{
 
 
 def test_cached_decode_attention_mask():
-    """A cached decode step must ignore slots past `pos`, at any depth.
+    """A cached decode step must ignore slots past each query row's position.
 
     This test used to be parked: a two-layer `forward_cached` diverged at
     ~1e30 on the *second* layer while one layer was exact.  The compiler was
@@ -1241,23 +1241,40 @@ def test_cached_decode_attention_mask():
     list is now derived from the parsed signature, and the test runs 1, 2 and
     3 layers so a per-layer interleaving mistake cannot hide behind `L == 1`.
 
-    The mask is a plain f32 bias added to the scores, so the test is a
-    numeric one: hidden slots get exactly zero softmax probability, which
-    means an unwritten cache row must not change the output at all.  Without
-    the mask the zeros in unwritten slots dilute every row and the reference
-    below disagrees.
+    The mask is now 2-D (`i32[T, CT]`, one row per query row in the chunk) and
+    the test decodes in chunks of 1, 2 and 3 tokens.  With `chunk > 1` the
+    mask rows genuinely differ -- row 0 may only see `pos`, row 2 sees
+    `pos + 2` -- so a lowering that read the 2-D mask as row 0 for every row
+    (the silent miscompile fixed in `softmax`) produces different logits and
+    this test fails.  Without any mask the zeros in unwritten slots dilute
+    every row and the reference below disagrees.
     """
     for layers in (1, 2, 3):
-        _check_cached_decode(layers)
+        _check_cached_decode(layers, chunk=1)
+    for layers in (1, 2):
+        _check_cached_decode(layers, chunk=2)
+        _check_cached_decode(layers, chunk=3)
 
 
-def _check_cached_decode(L):
-    """One cached decode of four tokens through an `L`-layer decoder."""
+def test_cached_decode_mask_hides_garbage_slots():
+    """Unwritten cache rows may hold anything and must not reach the output.
+
+    A zeroed cache makes a broken mask quiet: a wrong row of zeros contributes
+    a finite, plausible score.  Here every cache row starts at +-1e30 and the
+    decode must still match the clean reference bit for bit -- only the slots
+    the model wrote for the current chunk (and earlier ones) may be read.
+    """
+    for chunk in (1, 2, 3):
+        _check_cached_decode(2, chunk=chunk, poison=True)
+
+
+def _check_cached_decode(L, chunk=1, poison=False):
+    """One cached decode of six tokens through an `L`-layer decoder."""
     from veloce.lmmodule import cached_module
 
-    V, D, F, CT = 16, 8, 16, 4
+    V, D, F, CT = 16, 8, 16, 6
     cfg = dict(name=f"kvtest{L}", V=V, D=D, F=F, layers=L)
-    src = cached_module(cfg, CT)
+    src = cached_module(cfg, CT, chunk=chunk)
 
     rng = np.random.default_rng(5)
     emb = (rng.standard_normal((V, D)) * 0.3).astype(np.float32)
@@ -1272,7 +1289,8 @@ def _check_cached_decode(L):
         mats[f"w2{l}"] = rng.integers(-1, 2, size=(D, F)).astype(np.int8)
     mats["nwf"] = nw
     head = rng.integers(-1, 2, size=(V, D)).astype(np.int8)
-    toks = [3, 11, 0, 7]
+    toks = [3, 11, 0, 7, 5, 9]
+    assert len(toks) % chunk == 0
 
     def packed(name):
         w = mats[name]
@@ -1280,9 +1298,13 @@ def _check_cached_decode(L):
             return vw_pack(w)
         return list(w.flatten())
 
-    decls = [f"static float ck[{L}][{CT*D}] = {{0}};",
-             f"static float cv[{L}][{CT*D}] = {{0}};",
-             f"static int32_t mask[{CT}];"]
+    decls = [f"static float ck[{L}][{CT*D}];",
+             f"static float cv[{L}][{CT*D}];",
+             f"static int32_t mask[{chunk}][{CT}];",
+             f"static int32_t tok_buf[{chunk}];",
+             "static void poison(float *p, int n) {",
+             "    for (int i = 0; i < n; i++) p[i] = (i & 1) ? -1e30f : 1e30f;",
+             "}"]
     # `emb` is fp16 storage: the C runtime takes a uint16_t table.
     decls.append("    " + carr("emb", "uint16_t",
                                list(emb.astype(np.float16).view(np.uint16)
@@ -1299,12 +1321,12 @@ def _check_cached_decode(L):
     cached_fn = next(f for f in veloce.parse(veloce.tokenize(src)).functions
                      if f.name == "forward_cached")
 
-    def _cached_arg(name, tok, pos):
+    def _cached_arg(name, pos):
         """C expression for one `forward_cached` parameter, matched by name."""
         if name == "emb":
             return "emb"
         if name == "tok":
-            return str(tok)
+            return "tok_buf"
         if name == "pos":
             return str(pos)
         if name == "mask":
@@ -1315,14 +1337,24 @@ def _check_cached_decode(L):
         return name  # nw{l}, wq{l}, ..., nwf, head
 
     loop = []
-    for t, tok in enumerate(toks):
-        loop.append(
-            f"    for (int i = 0; i < {CT}; i++) mask[i] = (i <= {t}) ? 1 : 0;")
-        args = ", ".join(_cached_arg(p.name, tok, t)
-                         for p in cached_fn.params)
+    for l in range(L):
+        loop.append(f"    if ({1 if poison else 0}) {{ "
+                    f"poison(ck[{l}], {CT*D}); poison(cv[{l}], {CT*D}); }} else {{ "
+                    f"for (int i = 0; i < {CT*D}; i++) "
+                    f"ck[{l}][i] = cv[{l}][i] = 0.0f; }}")
+    for t in range(0, len(toks), chunk):
+        for r in range(chunk):
+            loop.append(f"    tok_buf[{r}] = {toks[t + r]};")
+        # Row r of the mask belongs to query row r, which sits at position
+        # t + r and may see every slot up to it.
+        for r in range(chunk):
+            loop.append(f"    for (int i = 0; i < {CT}; i++) "
+                        f"mask[{r}][i] = (i <= {t + r}) ? 1 : 0;")
+        args = ", ".join(_cached_arg(p.name, t) for p in cached_fn.params)
         loop.append(f"    float *o{t} = veloce_forward_cached({args});")
-        loop.append(f'    for (int i = 0; i < {V}; i++) '
-                    f'printf("t{t} %a\\n", o{t}[i]);')
+        loop.append(f"    for (int i = 0; i < {V}; i++) "
+                    f'printf("t{t + chunk - 1} %a\\n", '
+                    f"o{t}[{(chunk - 1) * V} + i]);")
 
     # Prototype straight from the compiled AST, so it cannot drift from the
     # real signature (a hand-written one silently truncates every pointer).
@@ -1339,7 +1371,8 @@ int main(void) {{
     return 0;
 }}
 """
-    rc, out, err, _ = util.build_and_run(src, driver, name=f"kv_cached{L}")
+    rc, out, err, _ = util.build_and_run(src, driver,
+                                         name=f"kv_cached{L}_{chunk}")
     assert rc == 0, err
 
     got = {}
@@ -1347,7 +1380,7 @@ int main(void) {{
         tag, hexval = line.split()
         got.setdefault(tag, []).append(float.fromhex(hexval))
 
-    # ---- reference: fp64 with a strictly causal mask ---------------------
+    # ---- reference: fp64, token by token, strictly causal -----------------
     ck = [np.zeros((CT, D)) for _ in range(L)]
     cv = [np.zeros((CT, D)) for _ in range(L)]
     scale = np.float64(1.0 / np.sqrt(D))
@@ -1372,8 +1405,13 @@ int main(void) {{
             x = x + h @ mats[f"w2{l}"].astype(np.float64).T
         xn = _rmsnorm64(x, nw)
         ref = xn @ head.astype(np.float64).T
+        # Only the last row of each chunk is printed: that is the token the
+        # caller would sample next.
+        if f"t{t}" not in got:
+            continue
         err = float(np.abs(np.array(got[f"t{t}"]) - ref).max())
-        assert err < 1e-4, f"layers {L}, token {t}: max|err| = {err:.3e}"
+        assert err < 1e-4, (f"layers {L}, chunk {chunk}, token {t}: "
+                            f"max|err| = {err:.3e}")
 
 
 def test_group_scaled_i2_fp8_matmul_numeric():

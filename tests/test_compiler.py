@@ -471,6 +471,9 @@ class TestBenchmarkArtefact(unittest.TestCase):
         self.assertIsInstance(cached, dict, "midi_lm_results.json has no cached block")
         self.assertEqual(cached["slots"], 64)
         self.assertGreaterEqual(cached["tokens"], 2)
+        # Chunk > 1 is what makes the per-row mask observable: with one row
+        # per call a broadcast mask would be indistinguishable.
+        self.assertGreaterEqual(cached["chunk"], 2)
         self.assertGreater(cached["best_tok_s"], 0.0)
         self.assertTrue(cached["deterministic"])
         self.assertTrue(cached["verify"]["pass"])
@@ -486,6 +489,8 @@ class TestBenchmarkArtefact(unittest.TestCase):
             mk = f.read()
         target = mk.split("bench-midi:", 1)[1].split("#", 1)[0]
         self.assertIn("--cached", target, "make bench-midi no longer records the cache run")
+        self.assertIn("--cached-chunk", target,
+                      "make bench-midi no longer exercises the per-row mask")
 
 
 class TestVeloceFormat(unittest.TestCase):
@@ -613,6 +618,67 @@ class TestDecoderModule(unittest.TestCase):
         from veloce.lmmodule import decoder_module
         with self.assertRaises(ValueError):
             decoder_module(dict(D=0))
+
+
+class TestCachedModule(unittest.TestCase):
+    """The cached decoder must use the per-row mask the runtime now selects."""
+
+    def setUp(self):
+        from veloce.lmmodule import cached_module
+        self.cfg = dict(name="kvmod", V=32, D=16, F=32, layers=1)
+        self.src = cached_module(self.cfg, 8, chunk=2)
+
+    def test_renders_two_dimensional_mask(self):
+        """`mask: i32[T, CT]` -- a 1-D mask cannot express one row per head."""
+        self.assertIn("dim T = 2", self.src)
+        self.assertIn("mask: i32[T, CT]", self.src)
+        self.assertIn("tok: i32[T]", self.src)
+        self.assertIn("embedding_seq(emb, tok)", self.src)
+        # One unrolled store per query row, at that row's own position.
+        self.assertIn("ck[pos] = k[0]", self.src)
+        self.assertIn("ck[pos + 1] = k[1]", self.src)
+        self.assertIn("cv[pos + 1] = v[1]", self.src)
+
+    def test_lowering_picks_the_per_row_kernel(self):
+        """A compiled cached module calls veloce_softmax_masked_rows.
+
+        The unit test for the per-row kernel only proves the kernel; nothing
+        proved the *benchmark module* reached it, and a 1-D mask there made
+        the broadcast kernel the only one ever built end to end.
+        """
+        res = veloce.compile_source(self.src, module_name="kvmod")
+        self.assertIn("veloce_softmax_masked_rows", res.c_source)
+        self.assertNotIn("veloce_softmax_masked(", res.c_source)
+
+    def test_chunk_one_is_still_two_dimensional(self):
+        """chunk=1 keeps the 2-D shape, so the 1-D mask path is gone."""
+        from veloce.lmmodule import cached_module
+        src = cached_module(self.cfg, 8, chunk=1)
+        self.assertIn("dim T = 1", src)
+        self.assertIn("mask: i32[T, CT]", src)
+        self.assertNotIn("mask: i32[CT]", src)
+        res = veloce.compile_source(src, module_name="kvmod1")
+        self.assertIn("veloce_softmax_masked_rows", res.c_source)
+
+    def test_cache_parameters_interleave_per_layer(self):
+        """ck/cv/nw/weights per layer: a host arg list must match the AST."""
+        fn = next(f for f in veloce.parse(veloce.tokenize(self.src)).functions
+                  if f.name == "forward_cached")
+        names = [p.name for p in fn.params]
+        self.assertEqual(names[:4], ["emb", "tok", "pos", "mask"])
+        self.assertEqual(names[4:14], ["ck1", "cv1", "nw1", "wq1", "wk1",
+                                       "wv1", "wo1", "w11", "w21", "w31"])
+        self.assertEqual(names[-2:], ["nwf", "head"])
+        self.assertEqual(names.count("ck1"), 1)
+        rw = [p.name for p in fn.params if getattr(p, "rw", False)]
+        self.assertEqual(rw, ["ck1", "cv1"])
+
+    def test_rejects_bad_chunk(self):
+        from veloce.lmmodule import cached_module
+        with self.assertRaises(ValueError):
+            cached_module(self.cfg, 8, chunk=0)
+        with self.assertRaises(ValueError):
+            cached_module(self.cfg, 0, chunk=1)
 
 
 if __name__ == "__main__":

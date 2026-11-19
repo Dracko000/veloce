@@ -79,7 +79,13 @@ fn append(rw cache: f32[CT, D], pos: i32, row: f32[1, D]) -> f32[1, D] {
 The buffer is never allocated by the generated code and never copied in or
 out, so a host loop can keep it alive across calls — that is how a KV cache is
 built (`examples/kv_decode.vel`). Only `rw` parameters and `let` bindings can
-be written to.
+be written to. The index may be an expression (`cache[pos + 1] = k[1]`), which
+is what lets one call write a whole chunk of rows.
+
+A cached decoder that consumes `T` tokens per call passes the attention mask as
+`i32[T, CT]` — one row per query row, so row `r` at position `pos + r` may see
+`pos + r` while row `r-1` may not. That is the per-row `softmax` form below;
+a 1-D mask would give every row the same visible slots.
 
 ## Statements
 

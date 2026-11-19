@@ -41,15 +41,7 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ## Open
 
-### 1. The cached decoder still passes a 1-D mask
-
-`veloce/lmmodule.py` renders `mask: i32[CT]` and passes it to
-`softmax(scores, mask)`, so the per-row path is unit-tested but never reached
-end to end. A per-head cached decoder needs `i32[H, CT]` (or `i32[1, CT]` with
-a zeroed `head + 1` slot), which is now expressible: `make bench-midi` with a
-2-D mask should still verify at rel err ~1.5e-6.
-
-### 2. The 7B-class target is still failing
+### 1. The 7B-class target is still failing
 
 `benchmarks/results.json` projects 3.04-3.27 tok/s for the 7B-class shape
 against a PRD target of 15 tok/s, with a measured 2.68 tok/s hardware ceiling
@@ -57,6 +49,27 @@ from the same-run probe. The GEMV is decode-bound, not bandwidth-bound (22-31%
 of the streaming peak after the phase-grouped kernel).
 
 ## Done (most recent first)
+
+* **The cached decoder now decodes a chunk with a 2-D, per-row mask.**
+  `veloce/lmmodule.py` rendered `mask: i32[CT]` and decoded one token per
+  call, so the per-row softmax kernel was unit-tested but never reached end to
+  end -- and with a single row a broadcast mask would have been
+  indistinguishable anyway. `cached_module(cfg, slots, chunk=2)` now takes
+  `tok: i32[T]`, `mask: i32[T, CT]` and writes `ck[pos + r] = k[r]` /
+  `cv[pos + r] = v[r]` for every row (the renderer unrolls the stores; the DSL
+  index accepts `pos + r`). Row `r` hides every slot past `pos + r`, so the
+  mask rows differ and reading row 0 for all rows changes the logits --
+  forcing the broadcast kernel in `codegen.py` fails
+  `test_cached_decode_attention_mask` at `max|err| = 8.07`. New
+  `test_cached_decode_mask_hides_garbage_slots` starts every cache row at
+  `+-1e30` and still matches the float64 reference bit for bit
+  (`max|err| = 5.80` if the mask stops hiding unwritten slots), and
+  `TestCachedModule` pins the rendering (`mask: i32[T, CT]`, one store per
+  row) and the kernel choice (`veloce_softmax_masked_rows`, never the
+  broadcast kernel). `make bench-midi` records the chunked decode:
+  **25.62 tok/s, 39.03 ms/token** (32 tokens, 64 slots, 2/call) against
+  22.21 tok/s for the old one-token path, determinism PASS, verify rel err
+  1.25e-6. Suites 36 -> 37 e2e, 44 -> 49 compiler.
 
 * **`softmax(x, mask)` with a 2-D mask was a silent miscompile.** The
   typechecker accepted `i32[T, C]` (checking only the width) while the runtime

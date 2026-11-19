@@ -403,14 +403,25 @@ static uint64_t fnv1a(const void *p, size_t n) {
 
 __CACHE_DECLS__
 
-static int32_t mask_buf[__CT__];
+/* One mask row per query row in the chunk: row r belongs to the token at
+   position t + r, which may see every slot up to and including t + r.  The
+   rows differ, so a lowering that read row 0 for every row would change the
+   logits (the per-row softmax kernel is what makes this correct). */
+static int32_t mask_buf[__CH__ * __CT__];
 
 static const int toks[__NTOK__] = { __TOKS__ };
+
+static void fill_mask(int t, int ct) {
+    for (int r = 0; r < __CH__; r++)
+        for (int i = 0; i < ct; i++)
+            mask_buf[r * __CT__ + i] = (i <= t + r) ? 1 : 0;
+}
 
 int main(int argc, char **argv) {
     const char *wpath = argc > 1 ? argv[1] : "build/midi_lm.veloce";
     const char *dump = argc > 2 ? argv[2] : "-";
     const int V = __V__, CT = __CT__;
+    const int CH = __CH__;
 
     int fd = open(wpath, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
@@ -420,68 +431,66 @@ int main(int argc, char **argv) {
                                     MAP_PRIVATE, fd, 0);
     if (base == MAP_FAILED) { perror("mmap"); return 1; }
 
-    /* mask_buf[i] != 0 marks a slot that participates in softmax; hidden
-       slots are excluded from the max and the normaliser entirely, so their
-       content can never affect a score. */
-    for (int i = 0; i < CT; i++) mask_buf[i] = 0;
-
+    int t;
     float *out = NULL;
-    /* Warmup: two steps at pos 0, which writes the same row twice. */
-    for (int t = 0; t < 2; t++) {
-        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= 0) ? 1 : 0;
+    /* Warmup: one chunk at pos 0, which rewrites the same rows. */
+    fill_mask(0, CT);
+    for (t = 0; t < CH; t += CH)
         out = veloce_forward_cached(
         __CARGS__);
-    }
 
     /* Untimed pass for bit-exact determinism of the whole decode. */
     __CACHE_ZERO__
-    for (int i = 0; i < CT; i++) mask_buf[i] = 0;
-    for (int t = 0; t < __NTOK__; t++) {
-        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 1 : 0;
+    fill_mask(0, CT);
+    for (t = 0; t < __NTOK__; t += CH) {
+        fill_mask(t, CT);
         out = veloce_forward_cached(
         __CARGS__);
     }
+    /* Row CH-1 is the newest token: the one a caller would sample next. */
+    float *last = out + (CH - 1) * V;
     float *ref = (float *)malloc((size_t)V * sizeof(float));
-    memcpy(ref, out, (size_t)V * sizeof(float));
+    memcpy(ref, last, (size_t)V * sizeof(float));
 
     __CACHE_ZERO__
-    for (int i = 0; i < CT; i++) mask_buf[i] = 0;
+    fill_mask(0, CT);
     double t0 = now_ns();
-    for (int t = 0; t < __NTOK__; t++) {
-        for (int i = 0; i < CT; i++) mask_buf[i] = (i <= t) ? 1 : 0;
+    for (t = 0; t < __NTOK__; t += CH) {
+        fill_mask(t, CT);
         out = veloce_forward_cached(
         __CARGS__);
     }
     double t1 = now_ns();
-    int det = memcmp(ref, out, (size_t)V * sizeof(float)) == 0;
+    last = out + (CH - 1) * V;
+    int det = memcmp(ref, last, (size_t)V * sizeof(float)) == 0;
 
     int nonfinite = 0, argmax = 0;
     double sum = 0.0;
     for (int i = 0; i < V; i++) {
         unsigned bits;
-        memcpy(&bits, &out[i], 4);
+        memcpy(&bits, &last[i], 4);
         if ((bits & 0x7f800000u) == 0x7f800000u) nonfinite++;
-        sum += (double)out[i];
-        if (out[i] > out[argmax]) argmax = i;
+        sum += (double)last[i];
+        if (last[i] > last[argmax]) argmax = i;
     }
     if (strcmp(dump, "-") != 0) {
         FILE *f = fopen(dump, "wb");
-        if (f) { fwrite(out, sizeof(float), (size_t)V, f); fclose(f); }
+        if (f) { fwrite(last, sizeof(float), (size_t)V, f); fclose(f); }
     }
 
-    printf("CACHED threads=%s tokens=%d ms=%.4f per_token_ms=%.4f tok_s=%.2f "
-           "hash=%016llx det=%d argmax=%d sum=%.6f nonfinite=%d\n",
+    printf("CACHED threads=%s tokens=%d chunk=%d ms=%.4f per_token_ms=%.4f "
+           "tok_s=%.2f hash=%016llx det=%d argmax=%d sum=%.6f nonfinite=%d\n",
            getenv("VELOCE_THREADS") ? getenv("VELOCE_THREADS") : "auto",
-           __NTOK__, (t1 - t0) / 1e6, (t1 - t0) / 1e6 / __NTOK__,
+           __NTOK__, CH, (t1 - t0) / 1e6, (t1 - t0) / 1e6 / __NTOK__,
            __NTOK__ * 1e9 / (t1 - t0),
-           (unsigned long long)fnv1a(out, (size_t)V * sizeof(float)),
+           (unsigned long long)fnv1a(last, (size_t)V * sizeof(float)),
            det, argmax, sum, nonfinite);
     return det && nonfinite == 0 ? 0 : 2;
 }
 """
 
 
-def cached_artefacts(module, cfg, ct):
+def cached_artefacts(module, cfg, ct, chunk=1):
     """(C decls for the KV caches, arg list, zero-fill statement)."""
     bufs = cache_buffers(cfg, ct)
     decls = "\n".join(f"static float {n}[{ct * cfg['D']}] "
@@ -492,26 +501,37 @@ def cached_artefacts(module, cfg, ct):
     fn = next(f for f in module.functions if f.name == "forward_cached")
     args = []
     for p in fn.params:
+        # Names first: `tok` is a tensor (`i32[CH]`) but comes from the host
+        # token array, not from the weight file, so it has no `OFF_tok`.
         if p.name in host:
             args.append("mask_buf" if p.name == "mask" else p.name)
-        elif isinstance(p.type, veloce.ast_mod.TensorType):
-            args.append(f"({ctype_of(p.type)})(base + OFF_{p.name})")
         elif p.name == "tok":
-            args.append("toks[t]")
+            # `tok: i32[CH]`: one token per query row in the chunk.
+            args.append("toks + t")
         elif p.name == "pos":
             args.append("t")
+        elif isinstance(p.type, veloce.ast_mod.TensorType):
+            args.append(f"({ctype_of(p.type)})(base + OFF_{p.name})")
         else:
             raise SystemExit(f"unexpected forward_cached parameter {p.name!r}")
     return decls, ",\n        ".join(args), zero
 
 
-def build_and_run_cached(man, cfg, wpath, ct, ntok, dump, workdir):
-    """Build and time the cached decoder: N tokens through a real KV cache."""
+def build_and_run_cached(man, cfg, wpath, ct, ntok, dump, workdir,
+                        chunk=1):
+    """Build and time the cached decoder: N tokens through a real KV cache.
+
+    `chunk` tokens are decoded per call, so the mask has one row per
+    query row and the rows differ.
+    """
     import random
     rnd = random.Random(1234)
     toks = [rnd.randrange(cfg["V"]) for _ in range(ntok)]
 
-    src = cached_module(cfg, ct)
+    if ntok % chunk:
+        raise SystemExit(f"--tokens {ntok} must be a multiple of "
+                         f"--cached-chunk {chunk}")
+    src = cached_module(cfg, ct, chunk=chunk)
     vel_path = os.path.join(workdir, cfg["name"] + "_cached.vel")
     with open(vel_path, "w") as f:
         f.write(src)
@@ -524,13 +544,14 @@ def build_and_run_cached(man, cfg, wpath, ct, ntok, dump, workdir):
     with open(gen_c, "w") as f:
         f.write(res.c_source)
 
-    decls, cargs, zero = cached_artefacts(res.module, cfg, ct)
+    decls, cargs, zero = cached_artefacts(res.module, cfg, ct, chunk=chunk)
     drv_src = (CACHED_DRIVER_TEMPLATE
                .replace("__EXTERN__", extern_decl(res.module, "forward_cached"))
                .replace("__CACHE_DECLS__", decls)
                .replace("__CACHE_ZERO__", zero)
                .replace("__CARGS__", cargs)
                .replace("__CT__", str(ct))
+               .replace("__CH__", str(chunk))
                .replace("__NTOK__", str(ntok))
                .replace("__TOKS__", ", ".join(str(t) for t in toks))
                .replace("__V__", str(cfg["V"])))
@@ -562,7 +583,7 @@ def build_and_run_cached(man, cfg, wpath, ct, ntok, dump, workdir):
             rec[k] = v
         for k in ("ms", "per_token_ms", "tok_s", "sum"):
             rec[k] = float(rec[k])
-        for k in ("tokens", "det", "argmax", "nonfinite"):
+        for k in ("tokens", "chunk", "det", "argmax", "nonfinite"):
             rec[k] = int(rec[k])
         rec["hash"] = int(rec["hash"], 16)
         runs.append(rec)
@@ -729,6 +750,9 @@ def main():
                     help="KV-cache length for --cached (default 64)")
     ap.add_argument("--tokens", type=int, default=32,
                     help="tokens to decode in --cached mode (default 32)")
+    ap.add_argument("--cached-chunk", type=int, default=1, metavar="N",
+                    help="tokens decoded per --cached call; N > 1 makes the "
+                         "per-row attention mask observable (default 1)")
     args = ap.parse_args()
 
     cfg = parse_config(args.config)
@@ -843,10 +867,12 @@ def main():
         if args.tokens > ct:
             raise SystemExit(f"--tokens {args.tokens} exceeds --cache-slots {ct}")
         cdump = os.path.join(work, "midi_lm_cached_logits.bin")
+        chunk = args.cached_chunk
         cruns, toks, cres = build_and_run_cached(man, cfg, args.weights, ct,
-                                                 args.tokens, cdump, work)
+                                                 args.tokens, cdump, work,
+                                                 chunk=chunk)
         print()
-        print(f"-- cached decode: {args.tokens} tokens through a "
+        print(f"-- cached decode: {args.tokens} tokens ({chunk}/call) through a "
               f"{ct}-slot KV cache per layer --")
         print(f"{'threads':>8} {'total ms':>10} {'ms/token':>10} {'tok/s':>8} "
               f"{'hash':>18} {'det':>4}")
@@ -876,7 +902,8 @@ def main():
                     "scale": cscale, "pass": bool(cok)}
         print(f"cached vs eager  : {cbest:.2f} vs {best:.2f} tok/s "
               f"({cbest / best:.2f}x)")
-        cached = {"slots": ct, "tokens": args.tokens, "runs": cruns,
+        cached = {"slots": ct, "tokens": args.tokens, "chunk": chunk,
+                  "runs": cruns,
                   "best_tok_s": cbest, "deterministic": cdet,
                   "nonfinite": cnonfinite, "verify": cver,
                   "speedup_vs_eager": cbest / best}
