@@ -127,6 +127,23 @@ real module (see `test_erd_introspection`).
   kernel; end to end it is 23.6 tok/s / 42.3 ms per token against 22.3 tok/s /
   45–50 ms before.
 
+  **Two tokens per weight pass.**  A chunked decode multiplies the same packed
+  matrix by two x vectors; running the one-row kernel twice streamed the
+  matrix twice.  `veloce_trit_dot4x2_avx2` loads each packed byte and its
+  32-byte LUT row once and feeds both query rows from it (same four-phase
+  row groups as the one-row kernel), and `veloce_matmul_trit` dispatches
+  `M == 2` onto it.  Measured with the same microbench that produced the
+  one-row numbers, 100 reps, one thread: 4096² **7.59 → 10.71 GMAC/s per
+  token** (2.21 → 1.57 ms), 1536×4096 5.4 → 6.6-9.4 GMAC/s, i.e. 1.25-1.41×
+  per token.  Each (query row, neuron) keeps the one-row kernel's two
+  accumulator chains and reduction order, so the result is **bit-identical
+  to two `M == 1` passes** -- `test_trit_matmul_two_rows_share_one_weight_pass`
+  checks that with `memcmp` on two different `x` rows, at K = 1003 (5-row
+  phase stride) and K = 1024 (single phase), plus a float64 reference.  The
+  single-stream projection is unchanged by this (it decodes one token at a
+  time); it pays off when a caller decodes a chunk, as the cached decoder
+  does.
+
   The kernel is still *decode* bound, and the reason is now narrower: every
   packed byte costs a byte load plus a 32-byte LUT load for five useful values,
   and on this EPYC (128-bit FP units, 32-byte loads split in two) that is about
@@ -148,8 +165,9 @@ real module (see `test_erd_introspection`).
   two drift. Measured **25.9 tok/s on
   one thread** (38.5 ms median, best of 5 timed runs) in the committed
   artefact (`measured_at` 2026-11-19T21:16Z); with the KV cache, 32 tokens in
-  chunks of two run at **25.6 tok/s** (39.0 ms/token, 0.99x eager, rel err
-  1.25e-6). Threads 2-4 are slower on this shared host;
+  chunks of two run at **30.5 tok/s** (32.8 ms/token, 1.37x the eager path in
+  the same run, rel err 1.5e-6) after the two-row GEMV; 25.6 tok/s before it.
+  Threads 2-4 are slower on this shared host;
   the logits match a NumPy reference to 1.4e-6 relative error and hash
   identically at every thread count. The model sustains ~7 GMAC/s, the same
   rate as the standalone kernel, i.e. it runs at the kernel's compute
@@ -173,7 +191,7 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 37 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot) and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 38 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one- and two-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |

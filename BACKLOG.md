@@ -48,7 +48,36 @@ against a PRD target of 15 tok/s, with a measured 2.68 tok/s hardware ceiling
 from the same-run probe. The GEMV is decode-bound, not bandwidth-bound (22-31%
 of the streaming peak after the phase-grouped kernel).
 
+The two-row kernel measures 10.71 GMAC/s per token at 4096² (vs 7.59 for one
+row), so a *two-token-chunk* projection would be ~4.6 tok/s -- still 3x short
+of 15, and single-stream decode is unchanged because it decodes one token at a
+time. Next levers, in the order they look worth measuring: (a) `M == 3/4`
+still take the per-row path (M=4 measures 6.47 GMAC/s per token at 4096²,
+*worse* than M=1), so the two-row kernel is where the amortisation stops; a
+4-row/2-token variant is the obvious extension but costs registers (16
+accumulators + x windows already spill); (b) the per-token cost of the
+non-matmul work (rmsnorm, silu, softmax, launch) has never been isolated on a
+7B-shaped layer -- the 2.68 tok/s ceiling probe suggests it is a large share at
+that size.
+
 ## Done (most recent first)
+
+* **Two query rows share one weight pass in the trit GEMV.** A chunked decode
+  multiplies the same packed matrix by two x vectors, and the `M == 2` path
+  simply ran the per-row kernel twice -- the whole matrix streamed twice, so
+  chunking bought only 9% (chunk 2 was 24.3 vs 22.2 tok/s at chunk 1).
+  `veloce_trit_dot4x2_avx2` now loads each packed byte and its 32-byte LUT
+  row once for both query rows (same four-row phase groups), with the one-row
+  accumulator chains and reduction order preserved, and
+  `veloce_matmul_trit` dispatches `M == 2` onto it. Microbench (100 reps,
+  1 thread): 4096² **7.59 → 10.71 GMAC/s per token** (2.21 → 1.57 ms),
+  K=1536 5.4 → 6.6-9.4, K=1024 5.4 → 9.4. New
+  `test_trit_matmul_two_rows_share_one_weight_pass` pins the result to two
+  `M == 1` passes with `memcmp` (bit-identical), on K=1003 and K=1024, plus a
+  float64 reference. `make bench-midi` (artefact regenerated, host load 2.56):
+  cached decode **30.48 tok/s, 32.81 ms/token** (was 25.62), 1.37x the eager
+  path in the same run, determinism PASS, verify rel err 1.51e-6. Suites
+  37 -> 38 e2e.
 
 * **The cached decoder now decodes a chunk with a 2-D, per-row mask.**
   `veloce/lmmodule.py` rendered `mask: i32[CT]` and decoded one token per

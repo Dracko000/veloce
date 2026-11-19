@@ -797,6 +797,57 @@ int main(void) {{
     assert "phase_gemv maxerr" in out and "PASS" in out.split("phase_gemv")[1], out
 
 
+def test_trit_matmul_two_rows_share_one_weight_pass():
+    """M == 2 decodes the packed weights once for both query rows.
+
+    A chunked decode multiplies the same trit matrix by two different x
+    vectors.  The one-row kernel run twice streams the matrix twice; the
+    two-row kernel loads each packed byte and each 32-byte LUT row once and
+    feeds both rows from it.  That is only safe if the arithmetic per
+    (query row, neuron) is unchanged, so this test pins the M == 2 result to
+    *two M == 1 passes, bit for bit* -- not merely close -- and checks both
+    shapes that hit the two paths (K % 5 != 0 gives the 5-row phase stride,
+    K % 5 == 0 the single-phase one).
+    """
+    for K, N in ((1003, 20), (1024, 32)):
+        rng = np.random.default_rng(99)
+        X = rng.standard_normal((2, K)).astype(np.float32)
+        W = rng.integers(-1, 2, size=(N, K)).astype(np.int8)
+        expected = X.astype(np.float64) @ W.astype(np.float64).T
+
+        xl = ", ".join(cf(v) for v in X.flatten())
+        wl = ", ".join(str(int(v)) for v in W.flatten())
+        driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+#include <string.h>
+int main(void) {{
+    float x[2 * {K}] = {{ {xl} }};
+    int8_t w[{N*K}] = {{ {wl} }};
+    uint8_t packed[{(N*K+4)//5}];
+    veloce_pack_trits(packed, w, {N*K});
+    float g0[{N}], g1[{N}], d[2 * {N}];
+    veloce_matmul_trit(g0, x, packed, 1, {K}, {N});
+    veloce_matmul_trit(g1, x + {K}, packed, 1, {K}, {N});
+    veloce_matmul_trit(d, x, packed, 2, {K}, {N});
+    int same = memcmp(d, g0, sizeof(g0)) == 0
+            && memcmp(d + {N}, g1, sizeof(g1)) == 0;
+    printf("two_rows_matches_gemv %s\\n", same ? "PASS" : "FAIL");
+    for (int j = 0; j < 2 * {N}; j++) printf("%a\\n", d[j]);
+    return same ? 0 : 1;
+}}
+"""
+        rc, out, err, _ = util.build_and_run(
+            "module t\ndim A=1\nfn f(x: f32[A]) -> f32[A] { return x }\n", driver)
+        assert rc == 0, (rc, err, out)
+        assert "two_rows_matches_gemv PASS" in out, out
+        vals = [float.fromhex(v) for v in out.splitlines()
+                if not v.startswith("two_rows")]
+        got = np.array(vals, dtype=np.float64).reshape(2, N)
+        err = float(np.abs(got - expected).max())
+        assert err < 1e-4, (K, N, err)
+
+
 def test_parallel_matches_serial_transformer():
     """FR-4.2: the full transformer layer is deterministic under 4 threads."""
     root = os.path.dirname(HERE)

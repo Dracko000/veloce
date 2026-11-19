@@ -129,10 +129,11 @@ kernels. Representative result:
 | trit GEMV 4096×4096 (1 thread → 4 threads) | 8.8–9.3 → 19.7–23.0 GMAC/s (**2.2–2.5× speedup**) | — |
 | trit GEMV read bandwidth | 3.9–4.6 GB/s = **22–31% of peak** (decode-bound, see below) | — |
 | trit GEMV, four rows per pass vs one neuron at a time | **1.30–1.34×** median of 3 runs (K = 1024, 1536, 4096) | — |
+| trit GEMV, two tokens per call vs one (shared weight pass) | **1.25–1.41× per token** (4096²: 7.59 → 10.71 GMAC/s, 2.21 → 1.57 ms/token) | — |
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
-| **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **23.6 tok/s** (1 thread, 42.3 ms median; 25.9 tok/s best) | — |
+| **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **22–26 tok/s** (1 thread, 38–45 ms median; host-load dependent) | — |
 | same model, 2 threads | 28–36 tok/s (28–36 ms median; host-load dependent) | — |
-| same model, **KV-cached** decode (32 tokens, 64 slots/layer, 2 tokens/call) | **25.6 tok/s** (39.0 ms/token, 0.99× eager, verify rel err 1.3e-6) | — |
+| same model, **KV-cached** decode (32 tokens, 64 slots/layer, 2 tokens/call) | **30.5 tok/s** (32.8 ms/token, 1.37× eager in the same run, verify rel err 1.5e-6) | — |
 | projected 7B-class decode | **~2.4–3.0 tok/s** (compiled layer: 3.3–4.3 tok/s) | ≥ 15 tok/s (**5–6× short**) |
 | weight footprint (7B-class) | 1.3 GB vs 13.2 GB fp16 (90% saved) | ≥ 80% smaller ✅ |
 | compile time | ~4 ms | < 2 s ✅ |
@@ -173,12 +174,16 @@ one thread the model sustains ~7.4 GMAC/s — the same rate as the standalone
 kernel — so it runs at the kernel's compute roofline, and streams 55 MB of
 packed trits per token at ~1.42 GB/s (25.7 tok/s single-threaded on a quiet
 host). Decoding 32 tokens through a 64-slot per-layer KV cache runs at
-25.6 tok/s (39.0 ms/token, 0.99× the eager path) with a 1.3e-6 relative error
-against the NumPy reference. The cached driver decodes **two tokens per call**,
-so the attention mask carries one row per query row (`i32[T, CT]`) and
-different rows hide different slots -- a mask read as a single broadcast row
-would change the logits. Four tokens per call measured 24.9 tok/s, i.e. no
-further gain. Multi-thread scaling is limited by this shared
+30.5 tok/s (32.8 ms/token, 1.37× the eager path in the same run) with a 1.5e-6
+relative error against the NumPy reference. The cached driver decodes **two
+tokens per call**, so the attention mask carries one row per query row
+(`i32[T, CT]`) and different rows hide different slots -- a mask read as a
+single broadcast row would change the logits. The two tokens also share one
+weight pass: the two-row GEMV decodes each packed byte and LUT row once and
+feeds both query rows from it, which is where the 0.99× → 1.37× came from,
+and its result is bit-identical to two one-row passes (tested). Four tokens
+per call measured 24.9 tok/s before that kernel and has not been retested
+since. Multi-thread scaling is limited by this shared
 VM (load average ~1-2.7 on 4 vCPUs); 2 threads help, 4 usually hurt.
 
 The VM is shared, so numbers vary run to run; every benchmark reports medians

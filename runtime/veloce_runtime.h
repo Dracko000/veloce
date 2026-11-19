@@ -1012,6 +1012,92 @@ static inline void veloce_trit_dot4_avx2(const float *restrict x, const uint8_t 
 }
 #endif
 
+/* ---- Two query rows, one weight pass -------------------------------
+ * A decode that consumes two tokens per call multiplies the *same* packed
+ * matrix by two different x vectors.  Running the one-row kernel twice
+ * streams the whole matrix twice; here each packed byte and its 32-byte LUT
+ * row are loaded once and used by both query rows, so the weight traffic per
+ * token halves.  Every (query row, neuron) keeps the two-accumulator chain
+ * and the reduction order of the one-row kernel, so the values are
+ * bit-identical to two one-row passes (there is a test for exactly that).
+ */
+#if defined(VELOCE_HAVE_TRIT_AVX2)
+static inline void veloce_trit_dot4x2_avx2(const float *restrict xa,
+                                           const float *restrict xb,
+                                           const uint8_t *restrict w,
+                                           size_t base, size_t stride5, size_t K,
+                                           float *restrict out /* [2][4] */) {
+    __m256 acc[2][VELOCE_TRIT_ROWS][2];
+    float init[2][VELOCE_TRIT_ROWS];
+    const float *xs[2] = { xa, xb };
+    for (int m = 0; m < 2; m++)
+        for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+            acc[m][r][0] = _mm256_setzero_ps();
+            acc[m][r][1] = _mm256_setzero_ps();
+            init[m][r] = 0.0f;
+        }
+    const size_t skip = base % 5;       /* slot of the group's first trit */
+    size_t bi = base / 5;
+    size_t q = 0;
+    if (skip) {
+        const size_t n = (5 - skip < K) ? 5 - skip : K;
+        for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+            const float *v = VELOCE_TRIT_LUT_F32[w[bi + (size_t)r * stride5]];
+            for (int m = 0; m < 2; m++) {
+                const float *x = xs[m];
+                float t = 0.0f;
+                for (size_t s = 0; s < n; s++) t += x[s] * v[skip + s];
+                init[m][r] = t;
+            }
+        }
+        q = n;
+        bi += 1;
+    }
+    const size_t full = (K - q) / 5;
+    size_t b = 0;
+    for (; b + 4 <= full && q + 23 <= K; b += 4, q += 20) {
+        for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+            const uint8_t *wr = w + bi + (size_t)r * stride5 + b;
+            const float *v0 = VELOCE_TRIT_LUT_F32[wr[0]];
+            const float *v1 = VELOCE_TRIT_LUT_F32[wr[1]];
+            const float *v2 = VELOCE_TRIT_LUT_F32[wr[2]];
+            const float *v3 = VELOCE_TRIT_LUT_F32[wr[3]];
+            for (int m = 0; m < 2; m++) {
+                const float *x = xs[m] + q;
+                acc[m][r][0] = _mm256_fmadd_ps(_mm256_loadu_ps(x), _mm256_load_ps(v0), acc[m][r][0]);
+                acc[m][r][1] = _mm256_fmadd_ps(_mm256_loadu_ps(x + 5), _mm256_load_ps(v1), acc[m][r][1]);
+                acc[m][r][0] = _mm256_fmadd_ps(_mm256_loadu_ps(x + 10), _mm256_load_ps(v2), acc[m][r][0]);
+                acc[m][r][1] = _mm256_fmadd_ps(_mm256_loadu_ps(x + 15), _mm256_load_ps(v3), acc[m][r][1]);
+            }
+        }
+    }
+    for (int m = 0; m < 2; m++) {
+        const float *xr = xs[m];
+        for (int r = 0; r < VELOCE_TRIT_ROWS; r++) {
+            const __m256 s = _mm256_add_ps(acc[m][r][0], acc[m][r][1]);
+            const __m128 lo = _mm256_castps256_ps128(s);
+            const __m128 hi = _mm256_extractf128_ps(s, 1);
+            __m128 t = _mm_add_ps(lo, hi);
+            t = _mm_hadd_ps(t, t); t = _mm_hadd_ps(t, t);
+            float a = init[m][r] + _mm_cvtss_f32(t);
+            const uint8_t *wr = w + bi + (size_t)r * stride5;
+            size_t ee = b, qq = q;
+            for (; ee < full; ee++, qq += 5) {
+                const float *v = VELOCE_TRIT_LUT_F32[wr[ee]];
+                a += xr[qq] * v[0] + xr[qq + 1] * v[1] + xr[qq + 2] * v[2]
+                   + xr[qq + 3] * v[3] + xr[qq + 4] * v[4];
+            }
+            if (qq < K) {
+                const float *v = VELOCE_TRIT_LUT_F32[wr[ee]];
+                for (size_t k = qq, slot = 0; k < K; k++, slot++)
+                    a += xr[k] * v[slot];
+            }
+            out[m * VELOCE_TRIT_ROWS + r] = a;
+        }
+    }
+}
+#endif
+
 static inline void veloce_trit_dot4(const float *x, const uint8_t *w, size_t base,
                                     size_t stride5, size_t K, float *out) {
 #if defined(VELOCE_HAVE_TRIT_AVX2)
@@ -1019,6 +1105,17 @@ static inline void veloce_trit_dot4(const float *x, const uint8_t *w, size_t bas
 #else
     for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++)
         out[r] = veloce_trit_dot(x, w, base + r * stride5 * 5, K);
+#endif
+}
+
+static inline void veloce_trit_dot4x2(const float *xa, const float *xb,
+                                      const uint8_t *w, size_t base,
+                                      size_t stride5, size_t K, float *out) {
+#if defined(VELOCE_HAVE_TRIT_AVX2)
+    veloce_trit_dot4x2_avx2(xa, xb, w, base, stride5, K, out);
+#else
+    veloce_trit_dot4(xa, w, base, stride5, K, out);
+    veloce_trit_dot4(xb, w, base, stride5, K, out + VELOCE_TRIT_ROWS);
 #endif
 }
 
@@ -1060,6 +1157,35 @@ static inline void veloce_mm_trit_row(void *vctx, size_t i) {
     for (; j0 < c->N; j0++)
         orow[j0] = veloce_trit_dot(xr, c->w, j0 * c->K, c->K);
 }
+/* Same work split as the one-row GEMV, but both query rows for a tile are
+ * computed while its packed bytes are in registers. */
+typedef struct { float *out; const float *xa, *xb; const uint8_t *w;
+                 size_t K, N; } veloce_mm_trit2_ctx;
+
+static inline void veloce_mm_trit2_chunk(void *vctx, size_t t) {
+    const veloce_mm_trit2_ctx *c = (const veloce_mm_trit2_ctx *)vctx;
+    const size_t period = veloce_trit_phase(c->K);
+    const size_t tile = VELOCE_TRIT_ROWS * period;
+    const size_t stride5 = period * c->K / 5;
+    const size_t j0 = t * tile;
+    if (j0 + tile <= c->N) {
+        for (size_t ph = 0; ph < period; ph++) {
+            float part[2 * VELOCE_TRIT_ROWS];
+            veloce_trit_dot4x2(c->xa, c->xb, c->w, (j0 + ph) * c->K, stride5,
+                               c->K, part);
+            for (size_t r = 0; r < VELOCE_TRIT_ROWS; r++)
+                for (int m = 0; m < 2; m++)
+                    c->out[(size_t)m * c->N + j0 + ph + r * period] =
+                        part[m * VELOCE_TRIT_ROWS + r];
+        }
+        return;
+    }
+    for (size_t j = j0; j < c->N; j++) {
+        c->out[j] = veloce_trit_dot(c->xa, c->w, j * c->K, c->K);
+        c->out[c->N + j] = veloce_trit_dot(c->xb, c->w, j * c->K, c->K);
+    }
+}
+
 static inline void veloce_matmul_trit(float *out, const float *x, const uint8_t *w,
                                       size_t M, size_t K, size_t N) {
     veloce_mm_trit_ctx c = { out, x, w, M, K, N };
@@ -1070,6 +1196,12 @@ static inline void veloce_matmul_trit(float *out, const float *x, const uint8_t 
          * phase; it streams tile*row_bytes of packed weights. */
         veloce_parallel_for_sized((N + tile - 1) / tile, tile * row_bytes,
                                   veloce_mm_trit_gemv_chunk, &c);
+    } else if (M == 2) {
+        /* Two query rows per weight load: the packed bytes are decoded once
+         * for both tokens, so a two-token chunk streams the matrix once. */
+        veloce_mm_trit2_ctx c2 = { out, x, x + K, w, K, N };
+        veloce_parallel_for_sized((N + tile - 1) / tile, tile * row_bytes,
+                                  veloce_mm_trit2_chunk, &c2);
     } else {
         veloce_parallel_for_sized(M, N * row_bytes, veloce_mm_trit_row, &c);
     }
