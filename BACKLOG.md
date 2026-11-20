@@ -63,7 +63,12 @@ pointers are what spill next; (b) the per-token cost of the non-matmul work
 (rmsnorm, silu, softmax, launch) has never been isolated on a 7B-shaped layer
 -- at the 275.6M shape the gap between the modelled matmul time (~25.7 ms at
 10.7 GMAC/s per token) and the measured 15.7 ms/token on four threads says the
-kernel itself is what is left, but that has not been measured directly.
+kernel itself is what is left, but that has not been measured directly. A first
+attempt at a two-shape fit (D=1536 vs D=2048, cached, 4 threads) on 2026-11-20
+was inconclusive: the same-run bandwidth probe read 3.0 GB/s at 4 threads where
+the 275M run twenty minutes earlier read 19.5, i.e. the host was noisy enough
+to swamp the intercept. Repeat it on a quiet host, or instrument the compiled
+layer directly instead of fitting end-to-end times.
 
 ### 2. Logit hashes depend on compiler code layout
 
