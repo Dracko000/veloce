@@ -133,13 +133,34 @@ static inline size_t veloce_cache_bytes(int level) {
  * (below that a single core streams it faster than a team can be launched). */
 static inline int veloce_worth_parallel(size_t n, size_t bytes_per_item) {
     if (veloce_threads() <= 1 || n < 2) return 0;
-    /* Enough independent work to amortise a fork-join? Require the whole
-     * working set to exceed half of L2 and each task to be at least
-     * VELOCE_PAR_MIN elements (cheap guard against micro-kernels). */
-    if (n < (size_t)VELOCE_PAR_MIN && bytes_per_item < (size_t)8192) return 0;
+    /* Enough independent work to amortise a fork-join?  The working set must
+     * exceed half of L2.  The per-item size must not veto the split on its
+     * own: a 1536-wide trit tile is 6 KB of packed weights, but 308 of them
+     * are 1.9 MB, exactly the size that pays for a fork.  How many ways it
+     * splits is decided by the chunk grain below, which is a byte budget. */
     size_t total = n * bytes_per_item;
     size_t l2 = veloce_cache_bytes(2);
     return total >= l2 / 2;
+}
+
+/* Smallest chunk worth handing to a worker: a byte budget (a quarter of L2)
+ * expressed in items, never larger than the element floor VELOCE_PAR_GRAIN.
+ * An element is not a unit of work -- one item can be a 4-byte float or a
+ * 16 KB packed-weight tile -- so a floor expressed only in elements silently
+ * serialised whole kernels: `chunk = max(ceil(n/chunks), 512)` gives worker 0
+ * every item of any loop with n < 512*chunks and leaves the caller empty
+ * (measured: a 4096^2 two-row GEMV reported 1.06 CPUs utilised with
+ * VELOCE_THREADS=4, and 4 threads were 1.5x *slower* than one). */
+static inline size_t veloce_chunk_grain(size_t bytes_per_item) {
+    size_t grain = (size_t)VELOCE_PAR_GRAIN;
+    if (bytes_per_item) {
+        const size_t budget = veloce_cache_bytes(2) / 4;
+        size_t by_bytes = (budget + bytes_per_item - 1) / bytes_per_item;
+        if (by_bytes < 1) by_bytes = 1;
+        if (by_bytes < grain) grain = by_bytes;
+    }
+    if (grain < 1) grain = 1;
+    return grain;
 }
 
 /* Iterate `n` independent output elements. `body(ctx, i)` must be
@@ -280,8 +301,14 @@ static inline void veloce_parallel_for_sized(size_t n, size_t bytes_per_item,
         return;
     }
     size_t chunks = veloce_pool_chunks(p);
-    size_t chunk = (n + chunks - 1) / chunks;
-    if (chunk < (size_t)VELOCE_PAR_GRAIN) chunk = (size_t)VELOCE_PAR_GRAIN;
+    /* Split into at most as many chunks as the grain budget allows, then as
+     * many as there are lanes: every lane gets real work or stays out of the
+     * fork, never "worker 0 takes everything". */
+    size_t grain = veloce_chunk_grain(bytes_per_item);
+    size_t max_chunks = n / grain;
+    if (max_chunks < 1) max_chunks = 1;
+    if (max_chunks > chunks) max_chunks = chunks;
+    size_t chunk = (n + max_chunks - 1) / max_chunks;
 
     mtx_lock(&p->lock);
     p->fn = body; p->ctx = ctx; p->n = n; p->chunk = chunk;

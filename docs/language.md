@@ -36,8 +36,11 @@ Threading is selected at build time by the compiler driver:
 
 Compile-time knobs: `VELOCE_THREADS=n` pins worker count, `VELOCE_PAR_MIN`
 (default 1024) sets the minimum tensor size before threading, `VELOCE_PAR_GRAIN`
-sets the minimum task size, `VELOCE_POOL_SPIN` sets how long an idle worker
-spins before sleeping.
+(default 512) is the largest number of output elements one worker is handed —
+it is applied as a byte budget (a quarter of L2, expressed in items, capped by
+the element count), because a task size measured in elements alone collapses
+small-element loops onto a single worker — and `VELOCE_POOL_SPIN` sets how long
+an idle worker spins before sleeping.
 
 ## Types
 

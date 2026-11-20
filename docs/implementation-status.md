@@ -19,7 +19,7 @@ plainly.
 | FR-3.2 | In-place buffer reuse in a static Arena | Greedy first-fit allocator reuses freed 64-byte-aligned slots; peak = largest simultaneously-live set | `memplan.py` |
 | FR-3.3 | Zero-copy mmap loading of `.veloce` weights | On-disk layout == packed in-memory layout; `veloce_mmap_ro` maps read-only; tensors are cast in place; `weights.VeloceFile` exposes zero-copy `raw()` views | `weights.py`, `runtime/veloce_runtime.h` |
 | FR-4.1 | Multi-target codegen to a portable lower-level target | C11 output (portable across x86_64/ARM64; SIMD via `-march`); LLVM/Vulkan/WebGPU are future backends | `codegen.py` |
-| FR-4.2 | Implicit cache-aware CPU parallelism | **Implemented.** Every hot kernel splits independent output elements across cores through an internal `veloce_parallel_for`; OpenMP backend with `-fopenmp`, C11 `<threads.h>` pool otherwise, serial fallback. Chunking is cache-aware (L2-sized per-worker tiles), and each output element is accumulated by exactly one worker in fixed order, so results are **bit-identical for every thread count** | `runtime/veloce_runtime.h` (`veloce_parallel_for`, `veloce_worth_parallel`, `veloce_cache_bytes`), `velocec` (`-fopenmp` auto-detect) |
+| FR-4.2 | Implicit cache-aware CPU parallelism | **Implemented.** Every hot kernel splits independent output elements across cores through an internal `veloce_parallel_for`; OpenMP backend with `-fopenmp`, C11 `<threads.h>` pool otherwise, serial fallback. Chunking is cache-aware: the grain is a byte budget (a quarter of L2, expressed in items and capped by `VELOCE_PAR_GRAIN` elements), and no item size can veto a split on its own, so a 1.9 MB loop of 6 KB tiles still forks. Each output element is accumulated by exactly one worker in fixed order, so results are **bit-identical for every thread count** | `runtime/veloce_runtime.h` (`veloce_parallel_for`, `veloce_worth_parallel`, `veloce_cache_bytes`), `velocec` (`-fopenmp` auto-detect) |
 
 ## Non-functional requirements
 
@@ -107,7 +107,12 @@ real module (see `test_erd_introspection`).
   preserved. Kernels below the L2-cache threshold stay serial to avoid team
   launch overhead. `VELOCE_POOL=0` forces a serial build; `VELOCE_THREADS=n`
   pins the worker count, `VELOCE_PAR_MIN` (default 1024 output elements) sets
-  the smallest problem that is worth a fork-join.
+  the smallest problem that is worth a fork-join, and `VELOCE_PAR_GRAIN`
+  (default 512 elements) is the largest chunk one worker may be handed: the
+  grain is a *byte* budget (L2/4) expressed in items, so a loop of 308
+  six-kilobyte tiles splits four ways instead of collapsing onto one lane.
+  Applying that floor in elements alone was wrong for exactly this reason --
+  see the 2026-11-20 entry above.
 * **Measured performance (4-vCPU shared VM, load average ~2.2)**: the AVX2
   trit GEMV decodes 5 trits per byte with a 256-entry float LUT and works on
   four output rows per pass, reaching ~8.8–9.3 GMAC/s on one thread and
@@ -150,10 +155,11 @@ real module (see `test_erd_introspection`).
   three load slots per five MACs — ~3.3 MAC/cycle, which is where the kernel
   sits. A dense f32 FMA still reaches 1.5–2× the GEMV's MAC rate, and a pure
   read of the same packed bytes is 23–36× faster. A 7B-shaped layer compiled by
-  `velocec` runs at 30–32 GMAC/s (4.7–4.9 tok/s for 32 layers). A correct
-  bandwidth roofline on this VM is 9.5–15.8 tok/s, so the PRD's 15 tok/s target
-  is only reachable *if the decode overhead is removed* — it is not a hardware
-  wall, and the honest status is "FAIL today, real headroom".
+  `velocec` runs at 35.2 GMAC/s (5.44 tok/s for 32 layers) and the projected
+  single-stream decode is 4.03 tok/s. A correct bandwidth roofline on this VM
+  is 14.8 tok/s (19.5 GB/s measured), so the PRD's 15 tok/s target is only
+  reachable *if the decode overhead is removed* — it is not a hardware wall,
+  and the honest status is "FAIL today, real headroom".
 * **End-to-end mid-size model** (`benchmarks/bench_midi_lm.py`): a genuine
   275.6M-ternary-parameter decoder (6 layers, d=1536, ffn=6144, V=32000,
   T=1 without KV cache) built with the production packing code, written as a
@@ -162,17 +168,35 @@ real module (see `test_erd_introspection`).
   measures other sizes (`--config D=2048 --config F=5632 --config layers=7`,
   i.e. `make bench-midi-05b`); `examples/midi_lm.vel` is that renderer's
   default-config output and `test_default_render_matches_example` fails if the
-  two drift. Measured **25.9 tok/s on
-  one thread** (38.5 ms median, best of 5 timed runs) in the committed
-  artefact (`measured_at` 2026-11-19T21:16Z); with the KV cache, 32 tokens in
-  chunks of two run at **30.5 tok/s** (32.8 ms/token, 1.37x the eager path in
-  the same run, rel err 1.5e-6) after the two-row GEMV; 25.6 tok/s before it.
-  Threads 2-4 are slower on this shared host;
-  the logits match a NumPy reference to 1.4e-6 relative error and hash
-  identically at every thread count. The model sustains ~7 GMAC/s, the same
-  rate as the standalone kernel, i.e. it runs at the kernel's compute
-  roofline; four threads are usually *slower* than two because the VM has no
-  spare cores.
+  two drift. Measured in the committed artefact (`measured_at`
+  2026-11-20T21:30Z, host load 1.5): **33.7 tok/s on one thread** and
+  **62.9 tok/s on four** for the eager path, **63.6 tok/s** on four threads
+  with the KV cache (32 tokens, chunks of two, 15.7 ms/token, rel err 1.3e-6,
+  1.01x the eager path in the same run). Until the chunk-grain fix of the same
+  day, four threads ran the whole decode inside one worker and were *slower*
+  than one (15.4 vs 30.5 tok/s); the split now really happens, so the cached
+  decode scales 1.89x from one thread to four. The logits match a NumPy
+  reference to 1.4e-6 relative error and hash identically at every thread
+  count.
+
+* **The parallel split was silently a single worker** (fixed 2026-11-20).
+  `veloce_parallel_for_sized` computed `chunk = ceil(n/lanes)` and then clamped
+  it up to `VELOCE_PAR_GRAIN` (512 *elements*), so any loop with fewer than
+  512*lanes items handed every item to worker 0 and left the caller empty:
+  a two-row 4096² trit GEMV with `VELOCE_THREADS=4` ran at **1.06 CPUs
+  utilised** and was 1.5× *slower* than one thread. The same term vetoed
+  1536-wide trit tiles outright (`bytes_per_item < 8192`), so most of the
+  275.6M decoder never forked at all. The grain is now a byte budget (L2/4,
+  expressed in items, capped by the element floor) and the per-item size no
+  longer vetoes a split; `test_parallel_for_hands_every_lane_work` counts
+  distinct workers and asserts every item ran exactly once (with the old
+  formula it reports `lanes=1 covered=205` and fails). Measured on the
+  committed artefacts: trit GEMV 4096² one→four threads **9.19 → 26.13 GMAC/s
+  (2.84×)**, the 275.6M decoder **25.1 tok/s on one thread and 62.9 on four**
+  (the previous artefact measured 15.4 on four threads, i.e. *slower* than its
+  own 22.3 one-thread run), and its KV-cached decode **33.7 → 63.6 tok/s
+  (1.89×)**; the 7B-class projection moved from 3.04 to **4.03 tok/s** against
+  a 14.8 tok/s bandwidth ceiling.
 
 ## Model capability defaults
 
@@ -191,7 +215,7 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 38 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one- and two-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 39 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, a lane-coverage test that fails if a fork sends every item to one worker, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one- and two-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |

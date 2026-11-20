@@ -751,6 +751,74 @@ def test_parallel_trit_bit_exact():
         assert len(set(outs)) == 1, outs
 
 
+DRV = r"""#include "veloce_runtime.h"
+#include <stdio.h>
+#include <string.h>
+
+#define NITEMS 205
+static unsigned long lane_of[NITEMS];
+static int runs[NITEMS];
+
+static void record(void *ctx, size_t i) {
+    (void)ctx;
+    lane_of[i] = (unsigned long)thrd_current();
+    runs[i]++;
+}
+
+int main(void) {
+    memset(lane_of, 0, sizeof(lane_of));
+    veloce_parallel_for_sized(NITEMS, 16384, record, NULL);
+    int covered = 0, dup = 0, nlanes = 0;
+    unsigned long lanes[64];
+    for (int i = 0; i < NITEMS; i++) {
+        if (runs[i] == 1) covered++;
+        if (runs[i] > 1) dup++;
+        int found = 0;
+        for (int l = 0; l < nlanes; l++) if (lanes[l] == lane_of[i]) found = 1;
+        if (!found && nlanes < 64) lanes[nlanes++] = lane_of[i];
+    }
+    printf("LANES lanes=%d covered=%d items=%d dup=%d worth=%d grain=%zu\n",
+           nlanes, covered, NITEMS, dup,
+           veloce_worth_parallel(NITEMS, 16384), veloce_chunk_grain(16384));
+    printf("MIDI worth=%d grain1536=%zu grain6144=%zu\n",
+           veloce_worth_parallel(308, 6160),
+           veloce_chunk_grain(6160), veloce_chunk_grain(24600));
+    return 0;
+}
+"""
+
+
+def test_parallel_for_hands_every_lane_work():
+    """FR-4.2: a parallel loop must actually use the lanes it forks.
+
+    The chunk floor used to be an element count (chunk = max(ceil(n/chunks),
+    512)), so every loop with fewer than 512*lanes items went to worker 0 in
+    one piece and the caller got nothing -- a two-row 4096^2 trit GEMV ran at
+    1.06 CPUs with VELOCE_THREADS=4, and four threads were 1.5x *slower* than
+    one.  The grain is now a byte budget, and the per-item size no longer
+    vetoes a split on its own (a 1536-wide trit tile is 6 KB, but 308 of them
+    are the 1.9 MB that pays for a fork).
+    """
+    src = "module t<NL>dim A=1<NL>fn f(x: f32[A]) -> f32[A] { return x }<NL>".replace("<NL>", chr(10))
+    drv = DRV
+    rc, out, err, _ = _threads_build(src, drv, pool=1, threads=4, name="lanes")
+    assert rc == 0, err
+    lanes = [l for l in out.splitlines() if l.startswith("LANES")][0]
+    f = dict(kv.split("=") for kv in lanes.split()[1:])
+    assert int(f["items"]) == 205, lanes
+    assert int(f["covered"]) == 205, "items were skipped: " + lanes
+    assert int(f["dup"]) == 0, "items ran twice: " + lanes
+    assert int(f["worth"]) == 1, lanes
+    assert int(f["lanes"]) >= 2, "one lane did all the work: " + lanes
+    midi = [l for l in out.splitlines() if l.startswith("MIDI")][0]
+    f = dict(kv.split("=") for kv in midi.split()[1:])
+    # 308 tiles of a 1536-wide trit matrix: 1.9 MB, so it must be forkable...
+    assert int(f["worth"]) == 1, "1536-wide trit tiles are not forkable: " + midi
+    # ...and the grain must still allow a four-way split of those 308 items.
+    assert int(f["grain1536"]) <= 308 // 4, "grain forbids a 4-way split: " + midi
+    assert int(f["grain6144"]) <= 77 // 4, "grain forbids a 4-way split: " + midi
+
+
 def test_trit_gemv_phase_grouped_rows():
     """The four-row GEMV groups rows that share a byte *phase*: with the flat
     packing row j starts at slot (j*K)%5, so the kernel runs rows

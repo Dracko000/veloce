@@ -43,24 +43,64 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ### 1. The 7B-class target is still failing
 
-`benchmarks/results.json` projects 3.04-3.27 tok/s for the 7B-class shape
-against a PRD target of 15 tok/s, with a measured 2.68 tok/s hardware ceiling
-from the same-run probe. The GEMV is decode-bound, not bandwidth-bound (22-31%
-of the streaming peak after the phase-grouped kernel).
+`benchmarks/results.json` (2026-11-20) projects **4.03 tok/s** for the
+7B-class shape against a PRD target of 15 tok/s, with a **14.78 tok/s**
+bandwidth ceiling from the same-run probe (19.53 GB/s at 4 threads). The GEMV
+is decode-bound, not bandwidth-bound: 5.23 GB/s = **27% of the streaming peak**
+after the phase-grouped kernel, i.e. ~3.3 MAC/cycle for 3 load slots per 5
+MACs. Four threads now really do scale the kernel (9.19 → 26.13 GMAC/s, 2.84x)
+since the chunk-grain fix below, so the remaining 3.7x is inside the kernel,
+not in the team.
 
 The two-row kernel measures 10.71 GMAC/s per token at 4096² (vs 7.59 for one
-row), so a *two-token-chunk* projection would be ~4.6 tok/s -- still 3x short
-of 15, and single-stream decode is unchanged because it decodes one token at a
-time. Next levers, in the order they look worth measuring: (a) `M == 3/4`
-still take the per-row path (M=4 measures 6.47 GMAC/s per token at 4096²,
-*worse* than M=1), so the two-row kernel is where the amortisation stops; a
-4-row/2-token variant is the obvious extension but costs registers (16
-accumulators + x windows already spill); (b) the per-token cost of the
-non-matmul work (rmsnorm, silu, softmax, launch) has never been isolated on a
-7B-shaped layer -- the 2.68 tok/s ceiling probe suggests it is a large share at
-that size.
+row), and a chunked decode with the fixed split reaches 63.6 tok/s on the
+275.6M model. Next levers, in the order they look worth measuring: (a) `M ==
+3/4` still take the per-row path (M=4 measures 6.47 GMAC/s per token at 4096²,
+*worse* than M=1) and now also block a four-token chunk; a 2-output-row /
+4-query-row variant would halve the weight traffic again at the same 16
+accumulators the two-row kernel already uses, but the x windows and LUT
+pointers are what spill next; (b) the per-token cost of the non-matmul work
+(rmsnorm, silu, softmax, launch) has never been isolated on a 7B-shaped layer
+-- at the 275.6M shape the gap between the modelled matmul time (~25.7 ms at
+10.7 GMAC/s per token) and the measured 15.7 ms/token on four threads says the
+kernel itself is what is left, but that has not been measured directly.
+
+### 2. Logit hashes depend on compiler code layout
+
+Recompiling the same generated C against a runtime header whose only textual
+change was dead chunk arithmetic (`noop` variant, identical semantics) moved
+the 275.6M cached-decode hash from `dc987e4dba318be1` to `5e3465d5445b9ecc`
+and the logit sum from 8484.671124 to 8484.672795 (relative difference ~2e-7,
+well inside the 1.3e-6 verify tolerance). `-ffast-math` lets GCC re-contract
+FMAs when inlining changes, so "bit-identical" holds across thread counts and
+repeats *within one build*, which is what the tests check, but not across
+builds. Either pin the contraction (`-ffp-contract=fast` is already implied;
+an explicit `-mfma`/`-fno-tree-vectorize` knob would not help) or state the
+per-build caveat in the docs. Evidence: three binaries from one source,
+`grep CACHED` on each.
 
 ## Done (most recent first)
+
+* **The parallel split was one worker doing everything.** `chunk =
+  ceil(n/lanes)` was clamped up to `VELOCE_PAR_GRAIN` (512 *elements*), so any
+  loop with fewer than 512*lanes items went to worker 0 in one piece and the
+  caller got nothing; a separate `bytes_per_item < 8192` term vetoed every
+  1536-wide trit tile outright, so most of the 275.6M decoder never forked. A
+  two-row 4096² GEMV with `VELOCE_THREADS=4` reported **1.06 CPUs utilised**
+  and ran 1.5x *slower* than one thread; the committed decode artefact had 4
+  threads at 15.4 tok/s against 22.3 on one. The grain is now a byte budget
+  (L2/4, expressed in items, capped by the element floor) and the per-item size
+  no longer vetoes a split, so a 1.9 MB loop of 6 KB tiles splits four ways.
+  New `test_parallel_for_hands_every_lane_work` counts distinct `thrd_current`
+  ids, asserts every item ran exactly once and that the 1536-wide tile shape is
+  forkable; with the old formula it reports `lanes=1 covered=205` and fails,
+  and the old `bytes_per_item` veto makes its MIDI assertions fail too. Measured
+  in the regenerated artefacts (`measured_at` 2026-11-20T21:30Z, host load 1.5):
+  trit GEMV 4096² **9.19 → 26.13 GMAC/s (2.84x)** one→four threads, 275.6M
+  decoder **25.1 tok/s on one thread, 62.9 on four**, KV-cached decode
+  **33.7 → 63.6 tok/s (1.89x)**, 7B projection 3.04 → **4.03 tok/s** against a
+  14.78 tok/s ceiling. Determinism PASS, cached verify rel err 1.25e-6. Suites
+  38 → 39 e2e.
 
 * **Two query rows share one weight pass in the trit GEMV.** A chunked decode
   multiplies the same packed matrix by two x vectors, and the `M == 2` path
