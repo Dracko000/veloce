@@ -52,23 +52,26 @@ MACs. Four threads now really do scale the kernel (9.19 → 26.13 GMAC/s, 2.84x)
 since the chunk-grain fix below, so the remaining 3.7x is inside the kernel,
 not in the team.
 
-The two-row kernel measures 10.71 GMAC/s per token at 4096² (vs 7.59 for one
-row), and a chunked decode with the fixed split reaches 63.6 tok/s on the
-275.6M model. Next levers, in the order they look worth measuring: (a) `M ==
-3/4` still take the per-row path (M=4 measures 6.47 GMAC/s per token at 4096²,
-*worse* than M=1) and now also block a four-token chunk; a 2-output-row /
-4-query-row variant would halve the weight traffic again at the same 16
-accumulators the two-row kernel already uses, but the x windows and LUT
-pointers are what spill next; (b) the per-token cost of the non-matmul work
-(rmsnorm, silu, softmax, launch) has never been isolated on a 7B-shaped layer
--- at the 275.6M shape the gap between the modelled matmul time (~25.7 ms at
-10.7 GMAC/s per token) and the measured 15.7 ms/token on four threads says the
-kernel itself is what is left, but that has not been measured directly. A first
-attempt at a two-shape fit (D=1536 vs D=2048, cached, 4 threads) on 2026-11-20
-was inconclusive: the same-run bandwidth probe read 3.0 GB/s at 4 threads where
-the 275M run twenty minutes earlier read 19.5, i.e. the host was noisy enough
-to swamp the intercept. Repeat it on a quiet host, or instrument the compiled
-layer directly instead of fitting end-to-end times.
+Measuring the per-query shapes (2026-11-21, 4096², one thread, three runs) puts
+a number on what a token can cost: `M == 1` is 8.6 GMAC/s per token, two query
+rows per weight pass 12.9-14.0, and the shipped four-query pass 13.5 (1.63x
+over one row). Four output rows * four query rows is 32 accumulator registers,
+twice what AVX2 has, so a pass cannot get below one byte fetch plus one LUT row
+per twenty MACs -- that is the shape ceiling unless the decode itself changes.
+The single-stream projection is the `M == 1` number, so none of this moves it:
+the 3.7x has to come out of the one-row inner loop, not out of chunking.
+
+Next levers, in the order they look worth measuring: (a) the per-token cost of
+the non-matmul work (rmsnorm, silu, softmax, launch) has never been isolated on
+a 7B-shaped layer. At the 275.6M shape the gap between the modelled matmul time
+and the measured 15.7 ms/token on four threads says the kernel is what is left,
+but two attempts at a two-shape fit (D=1536 vs D=2048, cached, 4 threads) were
+inconclusive: on 2026-11-20 the same-run bandwidth probe read 3.0 GB/s where the
+275M run read 19.5, and on 2026-11-21 one binary measured 4096² layered GEMV at
+0.65, 0.83 and 1.75 ms/token on three consecutive runs. Instrument the compiled
+layer directly instead of fitting end-to-end times.  (b) `M == 3` still takes
+the per-row path; it needs a three-query pass, or one two-query pass plus one
+row, to share the weight stream as `M == 4` now does.
 
 ### 2. Logit hashes depend on compiler code layout
 
@@ -85,6 +88,24 @@ per-build caveat in the docs. Evidence: three binaries from one source,
 `grep CACHED` on each.
 
 ## Done (most recent first)
+
+* **A four-token chunk now shares one weight pass across four query rows.**
+  `M == 3/4` fell back to the per-row kernel, so a four-token chunk streamed
+  the whole matrix once per token; the obvious fix -- four output rows * four
+  query rows -- needs 32 vector accumulators and AVX2 has 16.
+  `veloce_trit_dot2x4_avx2` runs two output rows with four query rows (16
+  accumulators: 4 queries * 2 rows * 2 chains), fetches each packed 32-bit word
+  and each LUT row once for all four, and keeps the one-row kernel's two
+  accumulator chains and reduction order per (query row, neuron).
+  `veloce_matmul_trit` dispatches `M == 4` onto a chunk driver whose work item
+  is 2*period rows instead of 4*period. Measured 4096², one thread, three runs:
+  **1.94 → 1.19 ms per token, 8.6 → 13.5 GMAC/s per token (1.63x)**; four
+  threads best-of-10 0.65 → 0.50 ms/token (1.3x, host noisy). New
+  `test_trit_matmul_four_rows_share_one_weight_pass` pins `M == 4` to four
+  `M == 1` passes with `memcmp` at K = 1003/512/1024/1536 over whole tiles,
+  plus a float64 reference; pointing the second row's fetch at the first row's
+  bytes makes it fail (`four_rows_matches_gemv FAIL`). Suites 39 → 40 e2e.
+
 
 * **The parallel split was one worker doing everything.** `chunk =
   ceil(n/lanes)` was clamped up to `VELOCE_PAR_GRAIN` (512 *elements*), so any

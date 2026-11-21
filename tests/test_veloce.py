@@ -916,6 +916,66 @@ int main(void) {{
         assert err < 1e-4, (K, N, err)
 
 
+def test_trit_matmul_four_rows_share_one_weight_pass():
+    """M == 4 decodes the packed weights once for a four-token chunk.
+
+    Four output rows cannot share a pass with four query rows: 4 rows *
+    4 queries * 2 accumulator chains is 32 vector registers, twice what AVX2
+    has, so `M == 3/4` used to fall back to the per-row path and stream the
+    whole matrix once per token.  The four-query kernel runs two output rows
+    at a time instead (16 accumulators) and lets all four query rows share
+    each byte fetch and each LUT row, so the weight traffic per token is a
+    quarter of the per-row path.
+
+    Every (query row, neuron) keeps the two-accumulator chain and the
+    reduction order of the one-row kernel, so this pins the M == 4 result to
+    *four M == 1 passes, bit for bit*.  The shapes are whole tiles: M == 1's
+    scalar tail is inlined into a different function and re-contracts under
+    -ffast-math, so a partial tile would compare two code paths, not kernels.
+    """
+    for K, N in ((1003, 20), (1536, 40), (512, 40), (1024, 40)):
+        rng = np.random.default_rng(4242 + K)
+        X = rng.standard_normal((4, K)).astype(np.float32)
+        W = rng.integers(-1, 2, size=(N, K)).astype(np.int8)
+        expected = X.astype(np.float64) @ W.astype(np.float64).T
+
+        xl = ", ".join(cf(v) for v in X.flatten())
+        wl = ", ".join(str(int(v)) for v in W.flatten())
+        driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+#include <string.h>
+int main(void) {{
+    float x[4 * {K}] = {{ {xl} }};
+    int8_t w[{N*K}] = {{ {wl} }};
+    uint8_t packed[{(N*K+4)//5}];
+    veloce_pack_trits(packed, w, {N*K});
+    float g0[{N}], g1[{N}], g2[{N}], g3[{N}], d[4 * {N}];
+    veloce_matmul_trit(g0, x, packed, 1, {K}, {N});
+    veloce_matmul_trit(g1, x + {K}, packed, 1, {K}, {N});
+    veloce_matmul_trit(g2, x + 2 * {K}, packed, 1, {K}, {N});
+    veloce_matmul_trit(g3, x + 3 * {K}, packed, 1, {K}, {N});
+    veloce_matmul_trit(d, x, packed, 4, {K}, {N});
+    int same = memcmp(d, g0, sizeof(g0)) == 0
+            && memcmp(d + {N}, g1, sizeof(g1)) == 0
+            && memcmp(d + 2 * {N}, g2, sizeof(g2)) == 0
+            && memcmp(d + 3 * {N}, g3, sizeof(g3)) == 0;
+    printf("four_rows_matches_gemv %s\\n", same ? "PASS" : "FAIL");
+    for (int j = 0; j < 4 * {N}; j++) printf("%a\\n", d[j]);
+    return same ? 0 : 1;
+}}
+"""
+        rc, out, err, _ = util.build_and_run(
+            "module t\ndim A=1\nfn f(x: f32[A]) -> f32[A] { return x }\n", driver)
+        assert rc == 0, (rc, err, out)
+        assert "four_rows_matches_gemv PASS" in out, out
+        vals = [float.fromhex(v) for v in out.splitlines()
+                if not v.startswith("four_rows")]
+        got = np.array(vals, dtype=np.float64).reshape(4, N)
+        err = float(np.abs(got - expected).max())
+        assert err < 1e-4, (K, N, err)
+
+
 def test_parallel_matches_serial_transformer():
     """FR-4.2: the full transformer layer is deterministic under 4 threads."""
     root = os.path.dirname(HERE)

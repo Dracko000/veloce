@@ -149,6 +149,28 @@ real module (see `test_erd_introspection`).
   time); it pays off when a caller decodes a chunk, as the cached decoder
   does.
 
+  **Four tokens per weight pass.**  The same idea cannot be extended by simply
+  widening the row group: four output rows * four query rows is 32 vector
+  accumulators (4 queries × 4 rows × 2 chains), twice what AVX2 has, and `M ==
+  3/4` therefore fell back to the per-row path, streaming the whole matrix once
+  per token.  `veloce_trit_dot2x4_avx2` instead pairs **two** output rows with
+  **four** query rows (16 accumulators) and shares each packed byte and its LUT
+  row across all four; `veloce_matmul_trit` dispatches `M == 4` onto it, with a
+  work item covering 2*period rows instead of 4*period.  Weight traffic per
+  token is a quarter of the per-row path and a half of the two-query kernel.
+  Measured on 4096², three runs, one thread (the stable configuration; four
+  threads on this shared VM vary by 2× run to run): **1.94 ms per token for
+  `M == 1` vs 1.19 ms for the four-query pass, 8.6 → 13.5 GMAC/s per token
+  (1.63×)** and 1.6× the matrix bytes per second the one-row kernel streams.  At
+  four threads the best-of-10 pairs measured 0.50 vs 0.65 ms/token (1.3×), with
+  higher spread.  Per (query row, neuron) the two accumulator chains and
+  reduction order are unchanged, so `M == 4` is **bit-identical to four `M == 1`
+  passes** -- `test_trit_matmul_four_rows_share_one_weight_pass` pins that with
+  `memcmp` at K = 1003/512/1024/1536 over whole tiles, plus a float64
+  reference, and fails if the second row of a pass decodes the first row's
+  bytes (mutation-verified).  `M == 3` still takes the per-row path; it needs a
+  three-query pass (or one two-query pass plus one row) to share as well.
+
   The kernel is still *decode* bound, and the reason is now narrower: every
   packed byte costs a byte load plus a 32-byte LUT load for five useful values,
   and on this EPYC (128-bit FP units, 32-byte loads split in two) that is about
@@ -215,7 +237,7 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 39 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, a lane-coverage test that fails if a fork sends every item to one worker, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one- and two-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 40 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, a lane-coverage test that fails if a fork sends every item to one worker, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one-, two- and four-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |
