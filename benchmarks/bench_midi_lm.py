@@ -26,10 +26,12 @@ Usage
     python3 benchmarks/bench_midi_lm.py --verify         # NumPy cross-check
     python3 benchmarks/bench_midi_lm.py --json out.json
     python3 benchmarks/bench_midi_lm.py --cached        # + KV-cache decode
-    python3 benchmarks/bench_midi_lm.py --config D=2048,F=5632,layers=7
+    python3 benchmarks/bench_midi_lm.py --config D=2048 --config F=5632 --config layers=7
 
-``--config`` takes ``key=value`` pairs (``V``, ``D``, ``F``, ``layers``,
-``scale``, ``name``) and ``--model-dir`` sends both the generated module and
+``--config`` is repeatable, one ``KEY=VALUE`` per flag (``V``, ``D``, ``F``,
+``layers``, ``scale``, ``name``) — a comma-joined string is parsed as a single
+value, which silently renames the module instead of changing the shape.
+``--model-dir`` sends both the generated module and
 its ``.veloce`` weights there, so several shapes can be measured from one
 command without a hand-written ``.vel`` file per shape.
 """

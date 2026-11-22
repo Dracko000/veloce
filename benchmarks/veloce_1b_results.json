@@ -1,0 +1,103 @@
+{
+  "measured_at": "2026-11-22T12:44:06Z",
+  "model": {
+    "name": "veloce_1b",
+    "V": 32000,
+    "D": 2048,
+    "F": 5632,
+    "layers": 18
+  },
+  "params": {
+    "ternary": 990380032,
+    "embedding": 65536000,
+    "norm": 38912,
+    "layer_ternary": 51380224,
+    "head_ternary": 65536000
+  },
+  "file_bytes": 329327040,
+  "trit_bytes": 198076064,
+  "streamed_per_token": 198235808,
+  "weight_generation_s": 23.102401692420244,
+  "runs": [
+    {
+      "threads": "1",
+      "iters": 5,
+      "median_ms": 169.5988,
+      "best_ms": 148.9713,
+      "mean_ms": 170.1779,
+      "tok_s": 5.9,
+      "hash": 14967279936016151610,
+      "det": 1,
+      "argmax": 31195,
+      "sum": 8018.369559,
+      "nonfinite": 0,
+      "file_bytes": 329327040.0,
+      "effective_gbs": 1.1695912672,
+      "probe_gbs": 5.048467383328499,
+      "pct_of_probe": 23.167254106906366
+    },
+    {
+      "threads": "2",
+      "iters": 5,
+      "median_ms": 171.1047,
+      "best_ms": 96.922,
+      "mean_ms": 256.4881,
+      "tok_s": 5.84,
+      "hash": 14967279936016151610,
+      "det": 1,
+      "argmax": 31195,
+      "sum": 8018.369559,
+      "nonfinite": 0,
+      "file_bytes": 329327040.0,
+      "effective_gbs": 1.15769711872,
+      "probe_gbs": 8.369125729276206,
+      "pct_of_probe": 13.832951686581032
+    },
+    {
+      "threads": "3",
+      "iters": 5,
+      "median_ms": 90.6928,
+      "best_ms": 62.1569,
+      "mean_ms": 86.9861,
+      "tok_s": 11.03,
+      "hash": 14967279936016151610,
+      "det": 1,
+      "argmax": 31195,
+      "sum": 8018.369559,
+      "nonfinite": 0,
+      "file_bytes": 329327040.0,
+      "effective_gbs": 2.1865409622399996,
+      "probe_gbs": 7.869959830364625,
+      "pct_of_probe": 27.783381483138964
+    },
+    {
+      "threads": "4",
+      "iters": 5,
+      "median_ms": 79.1283,
+      "best_ms": 54.2388,
+      "mean_ms": 87.7169,
+      "tok_s": 12.64,
+      "hash": 14967279936016151610,
+      "det": 1,
+      "argmax": 31195,
+      "sum": 8018.369559,
+      "nonfinite": 0,
+      "file_bytes": 329327040.0,
+      "effective_gbs": 2.5057006131199997,
+      "probe_gbs": 10.564007912518724,
+      "pct_of_probe": 23.719223176183498
+    }
+  ],
+  "best_tok_s": 12.64,
+  "effective_gbs": 2.5057006131199997,
+  "probe_gbs": {
+    "1": 5.048467383328499,
+    "2": 8.369125729276206,
+    "3": 7.869959830364625,
+    "4": 10.564007912518724
+  },
+  "host_loadavg_1m": 1.2607421875,
+  "deterministic": true,
+  "verify": null,
+  "cached": null
+}

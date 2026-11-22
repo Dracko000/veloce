@@ -12,3 +12,6 @@ examples/codegen_many.vel
 examples/codegen_multi.vel
 examples/codegen_multi10.vel
 examples/midi_lm_05b.vel
+
+# model binaries are generated, not committed
+models/*/*.veloce

@@ -9,6 +9,7 @@
 #   make bench-midi end-to-end 275.6M ternary decoder, measured tok/s
 #   make model-module  re-render examples/midi_lm.vel from veloce/lmmodule.py
 #   make bench-midi-05b  same bench at d_model=2048 (0.5B-shaped config)
+#   make model-1b   1B-class ternary decoder (990M trits + 66M fp16 embed), eager + cached
 #   make plan       print materialisation savings for the transformer layer
 #   make venv       create .venv and install test dependencies
 #   make doctor     check the local toolchain
@@ -28,7 +29,7 @@ VENV_PY  := $(VENV)/bin/python
 VENV_REQ := requirements-test.txt
 VENV_STAMP := $(VENV)/.requirements.stamp
 
-.PHONY: all demo test examples kv train bench bench-midi bench-midi-05b bench-roofline \
+.PHONY: all demo test examples kv train bench bench-midi bench-midi-05b bench-roofline model-1b \
         model-module plan bench-throughput venv doctor clean
 
 all: $(VDIR)/transformer_block.c $(VDIR)/tiny_lm.c $(VDIR)/tiny_lm_cls.c $(VDIR)/hello.c
@@ -113,3 +114,13 @@ doctor:
 
 clean:
 	@rm -rf $(VDIR)
+
+# 1B-class decoder: V=32000 D=2048 F=5632 layers=18 -> 990,380,032 ternary params
+# + 65,536,000 fp16 embedding = 1.056B total. Weights ~329 MB (1.6 bits/trit).
+MODEL_1B = --config name=veloce_1b --config V=32000 --config D=2048 --config F=5632 --config layers=18
+
+model-1b: $(VENV_STAMP)
+	$(VENV)/python benchmarks/bench_midi_lm.py $(MODEL_1B) --model-dir models/veloce-1b \
+		--iters 5 --json benchmarks/veloce_1b_results.json
+	$(VENV)/python benchmarks/bench_midi_lm.py $(MODEL_1B) --model-dir models/veloce-1b \
+		--cached --iters 3 --json benchmarks/veloce_1b_cached.json
