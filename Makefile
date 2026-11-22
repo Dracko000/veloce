@@ -29,7 +29,7 @@ VENV_PY  := $(VENV)/bin/python
 VENV_REQ := requirements-test.txt
 VENV_STAMP := $(VENV)/.requirements.stamp
 
-.PHONY: all demo test examples kv train bench bench-midi bench-midi-05b bench-roofline model-1b \
+.PHONY: all demo test examples kv train train-native bigram bench bench-midi bench-midi-05b bench-roofline model-1b \
         model-module plan bench-throughput venv doctor clean
 
 all: $(VDIR)/transformer_block.c $(VDIR)/tiny_lm.c $(VDIR)/tiny_lm_cls.c $(VDIR)/hello.c
@@ -124,3 +124,16 @@ model-1b: $(VENV_STAMP)
 		--iters 5 --json benchmarks/veloce_1b_results.json
 	$(VENV)/python benchmarks/bench_midi_lm.py $(MODEL_1B) --model-dir models/veloce-1b \
 		--cached --iters 3 --json benchmarks/veloce_1b_cached.json
+
+# --- training tanpa Python -------------------------------------------------
+# byte-LM dilatih sepenuhnya di C: forward, backward, Adam, sampling deterministik.
+train-native:
+	@mkdir -p build
+	$(CC) -O3 -march=native -o build/train_native runtime/train_native.c -lm
+	./build/train_native data/corpus.txt 3000
+
+# bigram = bentuk tertutup: hitung pasangan byte sekali, tanpa iterasi gradien.
+bigram:
+	@mkdir -p build
+	$(CC) -O2 -march=native -o build/bigram runtime/bigram.c -lm
+	./build/bigram data/corpus.txt
