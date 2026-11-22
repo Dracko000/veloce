@@ -37,6 +37,28 @@ compiler is ours.
 
 Run: `python tests/test_train.py` (needs `numpy` from `.venv`).
 
+- `runtime/train_native.c` - a **hand-written** C byte-LM trainer: forward, backward,
+  Adam and sampling in one binary, no Python in the loop. It is not emitted by the
+  DSL (that is phase 2/3 below); it exists to put a ceiling on what the Python
+  reference costs per step and to prove the training math end to end in C.
+  Fixed step budget, no training-time RNG, so two runs produce bit-identical
+  weights. Measured on the documentation corpus (16-token context, d=64, h=128,
+  57 792 parameters, 3 000 steps, batch 64): **262 steps/s** (3.82 ms/step),
+  loss 5.6029 -> 3.0793, held-out 3.3206 (ppl 27.68), weight hash
+  `def72f261ff7fa89` identical across runs.
+- `runtime/bigram.c` - the closed-form control: a byte bigram MLE is a single
+  counting pass, so "training" costs 0.31 ms and 0 gradient iterations.
+  Cross-entropy **4.2838 bit/byte** (ppl 19.48) on the same split.
+- `benchmarks/np_baseline_same_arch.py` - the same byte-LM architecture and
+  hyper-parameters in NumPy, to price the Python reference against the native
+  binary: **229.8 steps/s** against 262 native (1.14x). The two do not share
+  initialisation order, so the loss curves are not comparable; only the step
+  rate is.
+- `tools/make_corpus.py` - generates `data/corpus.txt` from this repository's own
+  documentation (66 602 bytes, 8 files), so the demos are reproducible and the
+  corpus carries nothing that is not already public here. Regenerate with
+  `make corpus`.
+
 ## What is not built yet
 
 1. **DSL emitter** — graph → `.vel` source for `forward` and `backward`. The op set above

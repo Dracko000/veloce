@@ -209,12 +209,13 @@ broadcast one.
 
 ## Serving & export scope
 
-Two export/serving paths exist and both are exercised by a `make` target:
+Three export/serving paths exist, each exercised by a `make` target:
 
 | Path | Scale | Command |
 |------|-------|---------|
 | QAT train → ternarize → pack → compile → mmap-deploy | 26.9k params (92% ternary) | `make train` |
 | Production packing → `.veloce` → mmap'd forward pass | 275.6M ternary params | `make bench-midi` |
+| 1B-class ternary decoder → eager + KV-cache decode | 1.06B params (990M trits, 329 MB file) | `make model-1b` |
 
 `make train` is the full quantization-aware-training loop: a NumPy trainer
 trains with a straight-through ternary estimator, `weights.save_veloce` writes
@@ -222,6 +223,19 @@ the packed file, `velocec` compiles the `.vel` module to C, and the resulting
 binary memory-maps the weights and serves predictions (32/32 match the NumPy
 reference). `make bench-midi` takes the same export path at 275.6M parameters
 and measures real decode throughput from the memory map.
+
+`make model-1b` compiles and runs an 18-layer, d=2048 decoder with 990M ternary
+weights (329 MB mmap) on this 4-vCPU box: **7.25 tok/s on one thread**, 12.42 on
+two, 11.0 with a 64-slot KV cache on four, one logit hash across every thread
+count. The weights are initialised, not trained — the number measures the runtime,
+not language ability; `models/veloce-1b/README.md` states that limitation in full.
+
+The training demos are separate and self-contained: `make train-native` (a
+hand-written C byte-LM trainer, 262 steps/s, bit-identical reruns),
+`make bigram` (closed-form bigram MLE, 4.2838 bit/byte) and
+`benchmarks/np_baseline_same_arch.py` (the same architecture in NumPy, 229.8
+steps/s); all three read `data/corpus.txt`, which `make corpus` regenerates from
+this repository's own documentation.
 
 Not implemented: QAT at 100M+ parameter scale. Training a 275M-parameter
 model needs GPUs and days; the mid-size harness therefore uses deterministic
