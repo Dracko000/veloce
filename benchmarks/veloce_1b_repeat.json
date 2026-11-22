@@ -1,0 +1,54 @@
+{
+ "model": "veloce_1b",
+ "shape": {
+  "V": 32000,
+  "D": 2048,
+  "F": 5632,
+  "layers": 18
+ },
+ "note": "5 independent runs per thread count, 5 timed iterations each, warm page cache, shared 4-vCPU host",
+ "runs": {
+  "1": {
+   "median_ms_per_run": [
+    131.6761,
+    144.2098,
+    131.9065,
+    139.5934,
+    137.8627
+   ],
+   "median_of_medians_ms": 137.9,
+   "tok_s_median_of_medians": 7.25,
+   "tok_s_best_run_median": 7.59,
+   "tok_s_best_single_pass": 7.89,
+   "spread_ratio": 1.1
+  },
+  "2": {
+   "median_ms_per_run": [
+    80.2803,
+    80.5227,
+    90.3345,
+    113.4992,
+    77.8635
+   ],
+   "median_of_medians_ms": 80.5,
+   "tok_s_median_of_medians": 12.42,
+   "tok_s_best_run_median": 12.84,
+   "tok_s_best_single_pass": 14.31,
+   "spread_ratio": 1.46
+  },
+  "4": {
+   "median_ms_per_run": [
+    82.7387,
+    46.5779,
+    87.1227,
+    148.804,
+    110.0031
+   ],
+   "median_of_medians_ms": 87.1,
+   "tok_s_median_of_medians": 11.48,
+   "tok_s_best_run_median": 21.47,
+   "tok_s_best_single_pass": 24.74,
+   "spread_ratio": 3.19
+  }
+ }
+}
