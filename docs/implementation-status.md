@@ -168,8 +168,22 @@ real module (see `test_erd_introspection`).
   passes** -- `test_trit_matmul_four_rows_share_one_weight_pass` pins that with
   `memcmp` at K = 1003/512/1024/1536 over whole tiles, plus a float64
   reference, and fails if the second row of a pass decodes the first row's
-  bytes (mutation-verified).  `M == 3` still takes the per-row path; it needs a
-  three-query pass (or one two-query pass plus one row) to share as well.
+  bytes (mutation-verified).
+
+  **Three tokens per weight pass.**  `M == 3` used to fall back to the per-row
+  path for the same register reason.  `veloce_trit_dot2x3_avx2` pairs two
+  output rows with three query rows (3 queries × 2 rows × 2 chains = 12
+  accumulators) and shares each packed byte and its LUT row across all three;
+  `veloce_matmul_trit` dispatches `M == 3` onto it, with a work item covering
+  2*period rows.  Weight traffic per token is a third of the per-row path.
+  Measured 4096², three runs, one thread: the three-query pass runs at
+  **12.3–12.6 GMAC/s per token vs 8.7–9.0 for three one-row passes (1.40–1.42×,
+  5.58 → 4.02 ms/token)**; 1536² is 1.30–1.36×.  Each (query row, neuron)
+  keeps the two accumulator chains and reduction order of the one-row kernel,
+  so `M == 3` is **bit-identical to three `M == 1` passes** --
+  `test_trit_matmul_three_rows_share_one_weight_pass` pins that with `memcmp`
+  at K = 1003/512/1024/1536 over whole tiles, plus a float64 reference, and
+  fails if a query row reads the first row's `x` (mutation-verified).
 
   The kernel is still *decode* bound, and the reason is now narrower: every
   packed byte costs a byte load plus a 32-byte LUT load for five useful values,

@@ -74,13 +74,14 @@ inflating `compiled_layer.GMAC` by 29%. Fixed, and `results.json` regenerated
 (2026-11-22T21:24Z): projected **3.78 tok/s**, compiled layer 1.6 tok/s in the
 same run, roofline 14.2 tok/s at 18.8 GB/s.
 
-What is left is the one-row inner loop, in this order: (a) `M == 3` still takes
-the per-row path -- it needs a three-query pass, or one two-query pass plus one
-row, to share the weight stream as `M == 4` now does; (b) the `M == 1` kernel
-itself (8.6-9.3 GMAC/s per token at 1 thread, ~3.3 MAC/cycle for three load
-slots per five MACs) is the single-stream number that matters for a 7B token,
-and nothing so far has moved it: the four-row and four-query passes only help
-when a chunk of tokens is decoded together.
+What is left is the one-row inner loop.  `M == 3` now shares a weight pass too
+(see Done): a three-query, two-output-row kernel (12 accumulators) runs three
+tokens at 1.40-1.42x one-row-per-token on 4096², bit-identical to three `M == 1`
+passes.  The remaining lever is (b): the `M == 1` kernel itself (8.6-9.3 GMAC/s
+per token at 1 thread, ~3.3 MAC/cycle for three load slots per five MACs) is the
+single-stream number that matters for a 7B token, and nothing so far has moved
+it: the two-, three- and four-query passes only help when a chunk of tokens is
+decoded together.
 
 ### 2. Logit hashes depend on compiler code layout
 
@@ -97,6 +98,23 @@ per-build caveat in the docs. Evidence: three binaries from one source,
 `grep CACHED` on each.
 
 ## Done (most recent first)
+
+* **A three-token chunk now shares one weight pass across three query rows.**
+  `M == 3` fell back to the per-row kernel, so a three-token chunk streamed the
+  matrix three times.  Three output rows * three query rows is 18 vector
+  accumulators, over AVX2's 16, so `veloce_trit_dot2x3_avx2` runs **two** output
+  rows with three query rows (3 queries * 2 rows * 2 chains = 12 accumulators),
+  fetches each packed 32-bit word and each LUT row once for all three, and
+  keeps the one-row kernel's two accumulator chains and reduction order per
+  (query row, neuron).  `veloce_matmul_trit` dispatches `M == 3` onto a chunk
+  driver whose work item is 2*period rows.  Measured 4096², one thread, three
+  runs: the three-query pass runs **12.3-12.6 GMAC/s per token vs 8.7-9.0 for
+  three one-row passes (1.40-1.42x, 5.58 -> 4.02 ms/token)**; 1536² is
+  1.30-1.36x.  New `test_trit_matmul_three_rows_share_one_weight_pass` pins
+  `M == 3` to three `M == 1` passes with `memcmp` at K = 1003/512/1024/1536 over
+  whole tiles, plus a float64 reference; pointing a query row at the first
+  row's `x` bytes makes it fail (`three_rows_matches_gemv FAIL`).  Suites 40 ->
+  41 e2e.
 
 * **The 7B layer is instrumented instead of fitted: it is 96–98% matmul.**
   `bench_throughput.py --layer-profile` compiles the layer, times it whole, and

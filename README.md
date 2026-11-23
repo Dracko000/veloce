@@ -131,6 +131,7 @@ kernels. Representative result:
 | trit GEMV, four rows per pass vs one neuron at a time | **1.30–1.34×** median of 3 runs (K = 1024, 1536, 4096) | — |
 | trit GEMV, two tokens per call vs one (shared weight pass) | **1.25–1.41× per token** (4096²: 7.59 → 10.71 GMAC/s, 2.21 → 1.57 ms/token) | — |
 | trit GEMV, four tokens per call vs one (quarter the weight traffic) | **1.63× per token** (4096², one thread: 8.6 → 13.5 GMAC/s per token, 1.94 → 1.19 ms/token) | — |
+| trit GEMV, three tokens per call vs one (a third the weight traffic) | **1.30–1.42× per token** (4096², one thread: 8.7–9.0 → 12.3–12.6 GMAC/s per token) | — |
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
 | **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **25–34 tok/s on one thread, 62.9 tok/s on four** (15.9 ms median; host-load dependent) | — |
 | same model, **KV-cached** decode (32 tokens, 64 slots/layer, 2 tokens/call) | **33.7 tok/s on one thread, 63.6 on four** (15.7 ms/token, verify rel err 1.3e-6) | — |
@@ -203,7 +204,10 @@ and its result is bit-identical to two one-row passes (tested). Four tokens
 per call now run a four-query kernel: two output rows at a time, 16
 accumulators, each packed byte and LUT row shared by all four rows — 4096² measures
 1.94 → 1.19 ms per token (1.63×, one thread, three runs), bit-identical to
-four one-row passes. Until 2026-11-20 four threads were *slower* than one: the work split
+four one-row passes. Three tokens per call run a three-query kernel the same
+way: two output rows at a time, 12 accumulators, each packed byte and LUT row
+shared by all three — 4096² measures 5.58 → 4.02 ms per token (1.40–1.42×, one
+thread, three runs), bit-identical to three one-row passes. Until 2026-11-20 four threads were *slower* than one: the work split
 clamped the chunk to `VELOCE_PAR_GRAIN` *elements*, which handed every loop
 with fewer than 512×lanes items to a single worker (a 4096² two-row GEMV ran
 at 1.06 CPUs utilised). With the grain treated as a byte budget, four threads

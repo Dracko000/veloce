@@ -916,6 +916,62 @@ int main(void) {{
         assert err < 1e-4, (K, N, err)
 
 
+def test_trit_matmul_three_rows_share_one_weight_pass():
+    """M == 3 decodes the packed weights once for a three-token chunk.
+
+    A three-token chunk multiplies the same trit matrix by three different x
+    vectors; the per-row path streams the whole matrix three times.  The
+    three-query kernel runs two output rows at a time (3 queries * 2 rows *
+    2 chains = 12 accumulators, which fits AVX2's 16) and feeds all three
+    query rows from each packed byte and its LUT row, so weight traffic per
+    token is a third of the per-row path.
+
+    Every (query row, neuron) keeps the two-accumulator chain and the
+    reduction order of the one-row kernel, so this pins the M == 3 result to
+    *three M == 1 passes, bit for bit*, on both the 5-row phase stride
+    (K % 5 != 0) and the single-phase shape (K % 5 == 0).
+    """
+    for K, N in ((1003, 20), (1536, 40), (512, 40), (1024, 40)):
+        rng = np.random.default_rng(7777 + K)
+        X = rng.standard_normal((3, K)).astype(np.float32)
+        W = rng.integers(-1, 2, size=(N, K)).astype(np.int8)
+        expected = X.astype(np.float64) @ W.astype(np.float64).T
+
+        xl = ", ".join(cf(v) for v in X.flatten())
+        wl = ", ".join(str(int(v)) for v in W.flatten())
+        driver = f"""
+#include "veloce_runtime.h"
+#include <stdio.h>
+#include <string.h>
+int main(void) {{
+    float x[3 * {K}] = {{ {xl} }};
+    int8_t w[{N*K}] = {{ {wl} }};
+    uint8_t packed[{(N*K+4)//5}];
+    veloce_pack_trits(packed, w, {N*K});
+    float g0[{N}], g1[{N}], g2[{N}], d[3 * {N}];
+    veloce_matmul_trit(g0, x, packed, 1, {K}, {N});
+    veloce_matmul_trit(g1, x + {K}, packed, 1, {K}, {N});
+    veloce_matmul_trit(g2, x + 2 * {K}, packed, 1, {K}, {N});
+    veloce_matmul_trit(d, x, packed, 3, {K}, {N});
+    int same = memcmp(d, g0, sizeof(g0)) == 0
+            && memcmp(d + {N}, g1, sizeof(g1)) == 0
+            && memcmp(d + 2 * {N}, g2, sizeof(g2)) == 0;
+    printf("three_rows_matches_gemv %s\\n", same ? "PASS" : "FAIL");
+    for (int j = 0; j < 3 * {N}; j++) printf("%a\\n", d[j]);
+    return same ? 0 : 1;
+}}
+"""
+        rc, out, err, _ = util.build_and_run(
+            "module t\ndim A=1\nfn f(x: f32[A]) -> f32[A] { return x }\n", driver)
+        assert rc == 0, (rc, err, out)
+        assert "three_rows_matches_gemv PASS" in out, out
+        vals = [float.fromhex(v) for v in out.splitlines()
+                if not v.startswith("three_rows")]
+        got = np.array(vals, dtype=np.float64).reshape(3, N)
+        err = float(np.abs(got - expected).max())
+        assert err < 1e-4, (K, N, err)
+
+
 def test_trit_matmul_four_rows_share_one_weight_pass():
     """M == 4 decodes the packed weights once for a four-token chunk.
 
