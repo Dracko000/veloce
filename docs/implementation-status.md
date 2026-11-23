@@ -220,6 +220,30 @@ real module (see `test_erd_introspection`).
   (1.89×)**; the 7B-class projection moved from 3.04 to **4.03 tok/s** against
   a 14.8 tok/s bandwidth ceiling.
 
+* **A 7B layer's time is 96–98% matmul, so the speed gap is inside the
+  kernel** (measured 2026-11-22). Two attempts to isolate the non-matmul cost
+  by fitting end-to-end times had been inconclusive, so the compiled layer is
+  now instrumented instead: `bench_throughput.py --layer-profile` compiles the
+  layer module, times it whole, then times the same seven trit matmuls one by
+  one through `veloce_matmul_trit` and the elementwise work (`silu` + multiply
+  over F) in the same process, with means over ten interleaved repetitions.
+  Measured at 1 thread: full layer 23.4–27.9 ms, of which matmul 23.4–26.7 ms
+  and elementwise 0.05–0.10 ms; across six runs the non-matmul share is
+  1.2–4.7% (one run read −0.7%, i.e. below measurement resolution). At four
+  threads it is 1.6–4.7%. There is no hidden second workload: the 4× gap to
+  15 tok/s has to come out of the one-row inner loop. The same
+  instrumentation caught a stale number — the compiled layer ran a
+  **two**-matmul MLP while the projection in [3b] assumed three, so
+  `compiled_layer.GMAC` was 29% too high (202.6M vs 157.3M MACs per layer).
+  The benchmark layer now runs the real three-matmul SwiGLU shape (`w1` gate,
+  `w3` up, `w2` down), so its per-token work matches the projection — and that
+  same ~29% of extra real arithmetic is why the compiled figure in the
+  regenerated artefact is **1.6 tok/s**, not the pre-fix 3.3–4.4: projected
+  **3.78 tok/s**, compiled layer 1.6 tok/s in the same run (host-load
+  dependent).
+  `benchmarks/results.json` regenerated (`measured_at` 2026-11-22T21:24Z,
+  host load 1.5).
+
 ## Model capability defaults
 
 Every `.veloce` export carries a capability model card (see

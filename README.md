@@ -126,15 +126,16 @@ kernels. Representative result:
 
 | Metric | Measured | PRD target |
 |--------|----------|------------|
-| trit GEMV 4096×4096 (1 thread → 4 threads) | 9.2 → 26.1 GMAC/s (**2.84× speedup**) | — |
-| trit GEMV read bandwidth | 5.2 GB/s = **27% of peak** (decode-bound, see below) | — |
+| trit GEMV 4096×4096 (1 thread → 4 threads) | 9.3 → 24.5 GMAC/s (**2.63× speedup**) | — |
+| trit GEMV read bandwidth | 4.9 GB/s = **26% of peak** (decode-bound, see below) | — |
 | trit GEMV, four rows per pass vs one neuron at a time | **1.30–1.34×** median of 3 runs (K = 1024, 1536, 4096) | — |
 | trit GEMV, two tokens per call vs one (shared weight pass) | **1.25–1.41× per token** (4096²: 7.59 → 10.71 GMAC/s, 2.21 → 1.57 ms/token) | — |
 | trit GEMV, four tokens per call vs one (quarter the weight traffic) | **1.63× per token** (4096², one thread: 8.6 → 13.5 GMAC/s per token, 1.94 → 1.19 ms/token) | — |
 | attention block (QK^T + softmax + AV) | ~31–35 GFLOP/s | — |
 | **end-to-end 275.6M ternary decoder** (6L, d=1536, ffn=6144, V=32000) | **25–34 tok/s on one thread, 62.9 tok/s on four** (15.9 ms median; host-load dependent) | — |
 | same model, **KV-cached** decode (32 tokens, 64 slots/layer, 2 tokens/call) | **33.7 tok/s on one thread, 63.6 on four** (15.7 ms/token, verify rel err 1.3e-6) | — |
-| projected 7B-class decode | **4.03 tok/s** (compiled layer: 5.44 tok/s) | ≥ 15 tok/s (**3.7× short**) |
+| projected 7B-class decode | **3.78 tok/s** (compiled layer: 1.6 tok/s in the same run; host-load dependent) | ≥ 15 tok/s (**4.0× short**) |
+| 7B-shaped layer split (1 thread) | **96–98% matmul**: 25–27 ms matmul vs 0.08 ms elementwise (silu + multiply over F); non-matmul 1.2–4.7% | — |
 | weight footprint (7B-class) | 1.3 GB vs 13.2 GB fp16 (90% saved) | ≥ 80% smaller ✅ |
 | compile time | ~4 ms | < 2 s ✅ |
 | heap allocation in generated C | none | zero ✅ |
@@ -142,9 +143,9 @@ kernels. Representative result:
 The 7B-class speed gap is NOT purely memory bandwidth, and the earlier claim
 that the kernel sat at the bandwidth roofline was measurement error. The old
 "streaming peak" was a scalar single-threaded byte-sum loop; the real ceiling
-this VM can stream is **19.5 GB/s at 4 threads** (6.0 GB/s at 1, both
-host-load dependent); its roofline is therefore 14.8 tok/s for the 7B class.
-Against that the trit GEMV achieves **5.2 GB/s — 27% of peak**, so it is
+this VM can stream is **18.8 GB/s at 4 threads** (host-load dependent);
+its roofline is therefore 14.2 tok/s for the 7B class. Against that the trit
+GEMV achieves **4.9 GB/s — 26% of peak**, so it is
 *decode* bound, not bandwidth bound: every packed byte needs a byte load plus
 a 32-byte LUT load for only 5 useful values.
 
@@ -163,6 +164,21 @@ FMA runs 1.5–2× the GEMV's MAC rate while reading 4× the bytes). Closing the
 rest is real optimization headroom, not a hardware wall; the 9.5–15.8 tok/s
 roofline printed above is only reachable once the decode stops being the
 bottleneck.
+
+Where does a 7B layer's time actually go? `bench_throughput.py --layer-profile`
+now answers that instead of fitting end-to-end times: it compiles the layer and
+times it as a whole, then times the same seven trit matmuls one by one and the
+elementwise work separately, all in one process with means over ten
+interleaved repetitions. Result at 1 thread: **25–27 ms in matmuls,
+0.08 ms in `silu` + multiply, 96–98% of the layer is matmul** (non-matmul
+1.2–4.7% across runs, the remainder being arena dispatch). The same module also
+caught a stale claim: the compiled layer used a two-matmul MLP while the
+projection assumed three, so its `GMAC` was 29% too high (202.6M vs 157.3M MACs
+per layer). The layer now runs the real three-matmul SwiGLU shape (`w1`, `w3`,
+`w2`), so its per-token work matches the projection — at the cost of the ~29%
+more real arithmetic that had been missing, which is why the same-run compiled
+figure in `results.json` reads **1.6 tok/s** rather than the pre-fix 3.3–4.4
+(host-load dependent).
 
 The mid-size number is a *real* end-to-end run, not a projection:
 `benchmarks/bench_midi_lm.py` generates a 275.6M-ternary-parameter decoder with

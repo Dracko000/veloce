@@ -1,5 +1,5 @@
 {
-  "measured_at": "2026-11-20T21:31:10Z",
+  "measured_at": "2026-11-22T21:24:35Z",
   "machine": {
     "cpu": "AMD EPYC Processor (with IBPB)",
     "cores": 4,
@@ -14,36 +14,46 @@
     "memory_reduction": 0.8
   },
   "trit_gemv": {
-    "T1_MS": 1.8263,
-    "T2_MS": 0.9571,
-    "T4_MS": 0.6421,
-    "T1_GMAC": 9.186,
-    "T2_GMAC": 17.529,
-    "T4_GMAC": 26.13,
+    "T1_MS": 1.8029,
+    "T2_MS": 0.9395,
+    "T4_MS": 0.6856,
+    "T1_GMAC": 9.306,
+    "T2_GMAC": 17.858,
+    "T4_GMAC": 24.47,
     "THREADS": 4.0
   },
-  "trit_gemv_speedup": 2.844546048334422,
+  "trit_gemv_speedup": 2.6294863528906083,
   "attention": {
-    "BEST_MS": 24.5901,
-    "FLOPS": 43.666
+    "BEST_MS": 24.0442,
+    "FLOPS": 44.657
   },
-  "membw_gbps": 19.531,
+  "membw_gbps": 18.823,
   "compiled_layer": {
-    "BEST_MS": 5.748,
-    "GMAC": 35.208,
-    "OUT": -364063.0,
+    "BEST_MS": 19.6799,
+    "GMAC": 10.283,
+    "OUT": -366514000.0,
     "macs_per_layer": 202375168.0
   },
-  "compiled_layer_tokens_per_sec": 5.436673625608907,
+  "compiled_layer_tokens_per_sec": 1.5879145727366502,
+  "layer_profile": {
+    "FULL_MS": 27.873,
+    "MATMUL_MS": 26.7051,
+    "EW_MS": 0.083,
+    "OUT": -366514000.0,
+    "other_ms": 1.1678999999999995,
+    "other_pct": 4.19007641803896,
+    "ew_pct": 0.2977792128583217,
+    "threads": "1"
+  },
   "projection": {
-    "tokens_per_sec": 4.034688639043036,
-    "ms_per_token": 247.85060000000001,
-    "gemv_gmacs": 26.128665316928824,
+    "tokens_per_sec": 3.778695412966065,
+    "ms_per_token": 264.6416,
+    "gemv_gmacs": 24.470851808634773,
     "macs_per_token": 6476005376,
-    "gap_x": 3.717759,
-    "roofline_tokens_per_sec": 14.780362699357616,
-    "achieved_gbps": 5.225733063385765,
-    "peak_gbps": 19.531
+    "gap_x": 3.9696239999999996,
+    "roofline_tokens_per_sec": 14.244573605550583,
+    "achieved_gbps": 4.894170361726956,
+    "peak_gbps": 18.823
   },
   "memory": {
     "params": 6607077376,
@@ -54,14 +64,14 @@
     "vs_f32_pct": 95.0
   },
   "compile": {
-    "seconds": 0.002978662960231304,
+    "seconds": 0.003405280876904726,
     "heap_calls": []
   },
   "summary": [
     {
       "requirement": "FR-4.2 parallel speedup > 1",
       "pass": true,
-      "measured": "2.84x on 4 cores"
+      "measured": "2.63x on 4 cores"
     },
     {
       "requirement": "Memory >=80% smaller than fp16",
@@ -81,7 +91,7 @@
     {
       "requirement": "Speed >= 15 tok/s (7B-class)",
       "pass": false,
-      "measured": "4.03 tok/s projected / 5.44 compiled (HW ceiling 14.78)"
+      "measured": "3.78 tok/s projected / 1.59 compiled (HW ceiling 14.24)"
     }
   ]
 }

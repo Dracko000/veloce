@@ -298,6 +298,10 @@ def bench_compiled_layer(quick, pool_flags):
     arena, emits C, and the C driver generates deterministic trit weights,
     then runs `veloce_layer()` repeatedly. It captures kernel + call overhead
     but not the rest of the 32-layer stack.
+
+    The MLP here is the three-matmul shape the 7B-class model actually uses
+    (`w1` gate, `w3` up, `w2` down with a SwiGLU elementwise product), so
+    `MACs per layer` is the same 4*D*D + 3*D*F the projection in [3b] assumes.
     """
     sys.path.insert(0, ROOT)
     import veloce
@@ -306,14 +310,15 @@ module bench_layer
 dim D = 4096
 dim F = 11008
 fn layer(x: f32[1, D], wq: trit[D, D], wk: trit[D, D], wv: trit[D, D],
-         wo: trit[D, D], w1: trit[F, D], w2: trit[D, F]) -> f32[1, D] {
+         wo: trit[D, D], w1: trit[F, D], w3: trit[F, D], w2: trit[D, F]) -> f32[1, D] {
     let q = matmul_trit(x, wq)
     let k = matmul_trit(x, wk)
     let v = matmul_trit(x, wv)
     let a = q + k + v
     let o = matmul_trit(a, wo)
     let h = matmul_trit(o, w1)
-    let s = silu(h)
+    let g = matmul_trit(o, w3)
+    let s = silu(h) * g
     return matmul_trit(s, w2)
 }
 """
@@ -326,25 +331,27 @@ fn layer(x: f32[1, D], wq: trit[D, D], wk: trit[D, D], wv: trit[D, D],
 #include <time.h>
 static double now(void){{struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}}
 float *veloce_layer(float *x, uint8_t *wq, uint8_t *wk, uint8_t *wv,
-                    uint8_t *wo, uint8_t *w1, uint8_t *w2);
+                    uint8_t *wo, uint8_t *w1, uint8_t *w3, uint8_t *w2);
 static void fill(uint8_t *p, size_t nbytes, unsigned seed) {{
     for (size_t i = 0; i < nbytes; i++) p[i] = (uint8_t)((i * 131u + seed * 17u) & 0xFFu);
 }}
 int main(void) {{
     const size_t D = 4096, F = 11008;
-    const size_t bytes_dd = (D * D + 4) / 5, bytes_fd = (F * D + 4) / 5, bytes_df = (D * F + 4) / 5;
+    const size_t bytes_dd = (D * D + 4) / 5, bytes_fd = (F * D + 4) / 5;
     float *x = malloc(D * sizeof(float));
     uint8_t *wq = malloc(bytes_dd), *wk = malloc(bytes_dd), *wv = malloc(bytes_dd);
-    uint8_t *wo = malloc(bytes_dd), *w1 = malloc(bytes_fd), *w2 = malloc(bytes_df);
-    if (!x || !wq || !wk || !wv || !wo || !w1 || !w2) {{ printf("ALLOC_FAIL\\n"); return 1; }}
+    uint8_t *wo = malloc(bytes_dd), *w1 = malloc(bytes_fd), *w3 = malloc(bytes_fd);
+    uint8_t *w2 = malloc(bytes_fd);
+    if (!x || !wq || !wk || !wv || !wo || !w1 || !w3 || !w2) {{ printf("ALLOC_FAIL\\n"); return 1; }}
     for (size_t i = 0; i < D; i++) x[i] = 0.01f * (float)((int)(i % 13) - 6);
     fill(wq, bytes_dd, 1); fill(wk, bytes_dd, 2); fill(wv, bytes_dd, 3);
-    fill(wo, bytes_dd, 4); fill(w1, bytes_fd, 5); fill(w2, bytes_df, 6);
-    float *out = veloce_layer(x, wq, wk, wv, wo, w1, w2);   /* warm + first-touch */
+    fill(wo, bytes_dd, 4); fill(w1, bytes_fd, 5); fill(w3, bytes_fd, 6);
+    fill(w2, bytes_fd, 7);
+    float *out = veloce_layer(x, wq, wk, wv, wo, w1, w3, w2);   /* warm + first-touch */
     double best = 1e9;
     for (int r = 0; r < {reps}; r++) {{
         double t = now();
-        out = veloce_layer(x, wq, wk, wv, wo, w1, w2);
+        out = veloce_layer(x, wq, wk, wv, wo, w1, w3, w2);
         t = now() - t; if (t < best) best = t;
     }}
     /* MACs per layer: 4*D*D attention projections + 3*D*F MLP */
@@ -364,6 +371,161 @@ int main(void) {{
         vals["OUT"] = None
     vals["macs_per_layer"] = 4.0 * 4096 * 4096 + 3.0 * 4096 * 11008
     return vals
+
+
+def bench_layer_profile(quick, pool_flags, threads=None):
+    """Split a compiled 7B-shaped layer into matmul time and everything else.
+
+    The end-to-end layer number in [3] says how long a layer takes, not where
+    it goes. This compiles the same layer module and times, in one process and
+    interleaved across repetitions (so external load hits every case equally):
+
+      * the full compiled layer (7 trit matmuls + adds + silu + multiply),
+      * the matmuls one by one through `veloce_matmul_trit` (exactly the call
+        codegen emits, same shapes, same buffers),
+      * the elementwise work the layer does (silu and a multiply over F).
+
+    `full - matmul_sum` is the non-matmul share of a layer; comparing it with
+    the separately measured elementwise time says whether that share is real
+    arithmetic or dispatch/arena overhead.
+    """
+    sys.path.insert(0, ROOT)
+    import veloce
+    src = """
+module bench_layer_prof
+dim D = 4096
+dim F = 11008
+fn layer_prof(x: f32[1, D], wq: trit[D, D], wk: trit[D, D], wv: trit[D, D],
+              wo: trit[D, D], w1: trit[F, D], w3: trit[F, D], w2: trit[D, F]) -> f32[1, D] {
+    let q = matmul_trit(x, wq)
+    let k = matmul_trit(x, wk)
+    let v = matmul_trit(x, wv)
+    let a = q + k + v
+    let o = matmul_trit(a, wo)
+    let h = matmul_trit(o, w1)
+    let g = matmul_trit(o, w3)
+    let s = silu(h) * g
+    return matmul_trit(s, w2)
+}
+"""
+    res = veloce.compile_source(src, module_name="bench_layer_prof")
+    if res.c_source.count("veloce_matmul_trit(") < 7:
+        raise RuntimeError("profiled layer lost matmuls")
+    driver = """
+#define _POSIX_C_SOURCE 199309L
+#include "veloce_runtime.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+1e-9*t.tv_nsec;}
+float *veloce_layer_prof(float *, uint8_t *, uint8_t *, uint8_t *, uint8_t *, uint8_t *, uint8_t *, uint8_t *);
+static void fill(uint8_t *p, size_t n, unsigned seed) {
+    for (size_t i = 0; i < n; i++) p[i] = (uint8_t)((i * 131u + seed * 17u) & 0xFFu);
+}
+int main(void) {
+    const size_t D = 4096, F = 11008;
+    const size_t bdd = (D * D + 4) / 5, bfd = (F * D + 4) / 5;
+    float *x = malloc(D * sizeof(float));
+    float *a = malloc(D * sizeof(float)), *o = malloc(D * sizeof(float));
+    float *y = malloc(D * sizeof(float));
+    float *h = malloc(F * sizeof(float)), *s = malloc(F * sizeof(float));
+    float *hf = malloc(F * sizeof(float));
+    uint8_t *wq = malloc(bdd), *wk = malloc(bdd), *wv = malloc(bdd), *wo = malloc(bdd);
+    uint8_t *w1 = malloc(bfd), *w3 = malloc(bfd), *w2 = malloc(bfd);
+    if (!x || !a || !o || !y || !h || !s || !hf || !wq || !wk || !wv || !wo || !w1 || !w3 || !w2) {
+        printf("ALLOC_FAIL\\n"); return 1;
+    }
+    for (size_t i = 0; i < D; i++) { x[i] = 0.01f * (float)((int)(i % 13) - 6); a[i] = x[i]; }
+    for (size_t i = 0; i < F; i++) hf[i] = 0.01f * (float)((int)(i % 11) - 5);
+    fill(wq, bdd, 1); fill(wk, bdd, 2); fill(wv, bdd, 3); fill(wo, bdd, 4);
+    fill(w1, bfd, 5); fill(w3, bfd, 6); fill(w2, bfd, 7);
+
+    float *out = veloce_layer_prof(x, wq, wk, wv, wo, w1, w3, w2);   /* warm + first touch */
+    (void)out;
+
+    double b_full = 0.0, b_mm = 0.0, b_ew = 0.0;   /* means over reps */
+    const int reps = __REPS__;
+    for (int r = 0; r < reps; r++) {
+        double t = now();
+        veloce_layer_prof(x, wq, wk, wv, wo, w1, w3, w2);
+        t = now() - t; b_full += t;
+
+        /* the same seven matmuls, individually, as codegen emits them */
+        t = now();
+        veloce_matmul_trit(o, x, wq, 1, D, D);
+        veloce_matmul_trit(o, x, wk, 1, D, D);
+        veloce_matmul_trit(o, x, wv, 1, D, D);
+        veloce_matmul_trit(y, o, wo, 1, D, D);
+        veloce_matmul_trit(h, y, w1, 1, F, D);
+        veloce_matmul_trit(h, y, w3, 1, F, D);
+        veloce_matmul_trit(a, h, w2, 1, D, F);
+        t = now() - t; b_mm += t;
+
+        /* elementwise work the layer does: adds over D, silu and mul over F */
+        t = now();
+        for (size_t i = 0; i < D; i++) a[i] = x[i] + x[i];
+        veloce_silu(s, hf, F);
+        for (size_t i = 0; i < F; i++) s[i] *= hf[i];
+        t = now() - t; b_ew += t;
+    }
+    printf("FULL_MS %.4f\\nMATMUL_MS %.4f\\nEW_MS %.4f\\nOUT %g\\n",
+           b_full / reps * 1e3, b_mm / reps * 1e3, b_ew / reps * 1e3, out ? out[0] : 0.0);
+    return 0;
+}
+""".replace("__REPS__", str(3 if quick else 10))
+    return _layer_profile_run(res.c_source, driver, pool_flags, threads)
+
+
+def _layer_profile_run(full_c, driver, pool_flags, threads=None):
+    """Compile the driver together with the generated module and run it."""
+    with tempfile.TemporaryDirectory() as td:
+        paths = {}
+        for name, text in (("drv", driver), ("gen", full_c)):
+            p = os.path.join(td, name + ".c")
+            with open(p, "w") as f:
+                f.write(text)
+            paths[name] = p
+        base = [CC, "-std=c11", "-O3", "-march=native", "-ffast-math",
+                "-pthread", "-I", RUNTIME, *pool_flags]
+        objs = []
+        for name in ("gen", "drv"):
+            obj = os.path.join(td, name + ".o")
+            r = sh([*base, "-c", paths[name], "-o", obj])
+            if r.returncode != 0:
+                raise RuntimeError(f"layer profile {name} build failed:\n{r.stderr}")
+            objs.append(obj)
+        exe = os.path.join(td, "layerprof")
+        r = sh([CC, *objs, *pool_flags, "-lm", "-o", exe])
+        if r.returncode != 0:
+            raise RuntimeError(f"layer profile link failed:\n{r.stderr}")
+        run_env = dict(os.environ)
+        if threads:
+            run_env["VELOCE_THREADS"] = str(threads)
+        p = sh([exe], timeout=600, env=run_env)
+        if p.returncode != 0:
+            raise RuntimeError(f"layer profile run failed:\n{p.stderr}")
+        vals = {}
+        for line in p.stdout.splitlines():
+            if not line.strip():
+                continue
+            k, v = line.split()
+            vals[k] = float(v)
+        vals["other_ms"] = vals["FULL_MS"] - vals["MATMUL_MS"]
+        vals["other_pct"] = 100.0 * vals["other_ms"] / vals["FULL_MS"] if vals["FULL_MS"] else 0.0
+        vals["ew_pct"] = 100.0 * vals["EW_MS"] / vals["FULL_MS"] if vals["FULL_MS"] else 0.0
+        vals["threads"] = str(threads or veloce_threads())
+        return vals
+
+
+def veloce_threads():
+    """Worker count the runtime will actually use (env override or online CPUs)."""
+    env = os.environ.get("VELOCE_THREADS")
+    if env and env.isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return nproc()
 
 
 def bench_memory():
@@ -437,7 +599,23 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--quick", action="store_true", help="fewer repetitions")
     ap.add_argument("--json", metavar="PATH", help="write machine-readable results")
+    ap.add_argument("--layer-profile", action="store_true",
+                    help="only split the 7B layer into matmul vs non-matmul time")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="worker count for --layer-profile (VELOCE_THREADS)")
     args = ap.parse_args()
+
+    if args.layer_profile:
+        omp = have_openmp()
+        pool_flags = ["-fopenmp"] if omp else []
+        prof = bench_layer_profile(args.quick, pool_flags, args.threads)
+        print(f"[layer profile] {prof['threads']} thread(s)")
+        print(f"  full layer  : {prof['FULL_MS']:9.3f} ms")
+        print(f"  matmul sum  : {prof['MATMUL_MS']:9.3f} ms "
+              f"({100.0*prof['MATMUL_MS']/prof['FULL_MS']:.1f}% of full)")
+        print(f"  elementwise : {prof['EW_MS']:9.3f} ms ({prof['ew_pct']:.2f}% of full)")
+        print(f"  non-matmul  : {prof['other_ms']:9.3f} ms ({prof['other_pct']:.1f}% of full)")
+        return
 
     omp = have_openmp()
     pool_flags = ["-fopenmp"] if omp else []
@@ -509,6 +687,15 @@ def main():
           f"-> {layer_tps:.2f} tok/s for {layers} layers")
     report["compiled_layer"] = layer
     report["compiled_layer_tokens_per_sec"] = layer_tps
+
+    # --- 3a. where the layer's time actually goes -----------------------
+    # Same module, timed as a whole and as its seven matmuls; the difference is
+    # everything the compiler does besides the multiplies.
+    prof = bench_layer_profile(args.quick, pool_flags, 1)
+    print(f"[3a] layer split, 1 thread: matmul {prof['MATMUL_MS']:.2f} ms "
+          f"({100.0*prof['MATMUL_MS']/prof['FULL_MS']:.1f}%), "
+          f"non-matmul {prof['other_ms']:.3f} ms ({prof['other_pct']:.1f}%)")
+    report["layer_profile"] = prof
     print()
 
     # --- 3b. model-level estimate --------------------------------------

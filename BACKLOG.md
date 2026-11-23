@@ -43,14 +43,14 @@ authenticated as Dracko000 via `gh`). There is no upstream and no fork.
 
 ### 1. The 7B-class target is still failing
 
-`benchmarks/results.json` (2026-11-20) projects **4.03 tok/s** for the
-7B-class shape against a PRD target of 15 tok/s, with a **14.78 tok/s**
-bandwidth ceiling from the same-run probe (19.53 GB/s at 4 threads). The GEMV
-is decode-bound, not bandwidth-bound: 5.23 GB/s = **27% of the streaming peak**
+`benchmarks/results.json` (2026-11-22) projects **3.78 tok/s** for the
+7B-class shape against a PRD target of 15 tok/s, with a **14.2 tok/s**
+bandwidth ceiling from the same-run probe (18.8 GB/s at 4 threads). The GEMV
+is decode-bound, not bandwidth-bound: 4.9 GB/s = **26% of the streaming peak**
 after the phase-grouped kernel, i.e. ~3.3 MAC/cycle for 3 load slots per 5
-MACs. Four threads now really do scale the kernel (9.19 → 26.13 GMAC/s, 2.84x)
-since the chunk-grain fix below, so the remaining 3.7x is inside the kernel,
-not in the team.
+MACs. Four threads now really do scale the kernel (9.3 → 24.5 GMAC/s, 2.63x;
+host-load dependent) since the chunk-grain fix below, so the remaining ~4x is
+inside the kernel, not in the team.
 
 Measuring the per-query shapes (2026-11-21, 4096², one thread, three runs) puts
 a number on what a token can cost: `M == 1` is 8.6 GMAC/s per token, two query
@@ -59,19 +59,28 @@ over one row). Four output rows * four query rows is 32 accumulator registers,
 twice what AVX2 has, so a pass cannot get below one byte fetch plus one LUT row
 per twenty MACs -- that is the shape ceiling unless the decode itself changes.
 The single-stream projection is the `M == 1` number, so none of this moves it:
-the 3.7x has to come out of the one-row inner loop, not out of chunking.
+the ~4x has to come out of the one-row inner loop, not out of chunking.
 
-Next levers, in the order they look worth measuring: (a) the per-token cost of
-the non-matmul work (rmsnorm, silu, softmax, launch) has never been isolated on
-a 7B-shaped layer. At the 275.6M shape the gap between the modelled matmul time
-and the measured 15.7 ms/token on four threads says the kernel is what is left,
-but two attempts at a two-shape fit (D=1536 vs D=2048, cached, 4 threads) were
-inconclusive: on 2026-11-20 the same-run bandwidth probe read 3.0 GB/s where the
-275M run read 19.5, and on 2026-11-21 one binary measured 4096² layered GEMV at
-0.65, 0.83 and 1.75 ms/token on three consecutive runs. Instrument the compiled
-layer directly instead of fitting end-to-end times.  (b) `M == 3` still takes
-the per-row path; it needs a three-query pass, or one two-query pass plus one
-row, to share the weight stream as `M == 4` now does.
+Measured 2026-11-22: the layer split (lever (a)) is **not** where the time goes.
+`bench_throughput.py --layer-profile` compiles the 7B-shaped layer and times it
+whole, then times the same seven matmuls one by one and the elementwise work in
+the same process (means over ten interleaved repetitions): at 1 thread the full
+layer is **23.4-27.9 ms of which 23.4-26.7 ms is matmul and 0.05-0.10 ms
+elementwise**, so non-matmul is **1.2-4.7%** across six runs (four threads:
+1.6-4.7%). The earlier inconclusive fits are explained: run-to-run host noise
+of 2-3x was swamping the 2-4% signal, and the same instrumentation found that
+the compiled layer ran a two-matmul MLP while the projection counted three,
+inflating `compiled_layer.GMAC` by 29%. Fixed, and `results.json` regenerated
+(2026-11-22T21:24Z): projected **3.78 tok/s**, compiled layer 1.6 tok/s in the
+same run, roofline 14.2 tok/s at 18.8 GB/s.
+
+What is left is the one-row inner loop, in this order: (a) `M == 3` still takes
+the per-row path -- it needs a three-query pass, or one two-query pass plus one
+row, to share the weight stream as `M == 4` now does; (b) the `M == 1` kernel
+itself (8.6-9.3 GMAC/s per token at 1 thread, ~3.3 MAC/cycle for three load
+slots per five MACs) is the single-stream number that matters for a 7B token,
+and nothing so far has moved it: the four-row and four-query passes only help
+when a chunk of tokens is decoded together.
 
 ### 2. Logit hashes depend on compiler code layout
 
@@ -88,6 +97,22 @@ per-build caveat in the docs. Evidence: three binaries from one source,
 `grep CACHED` on each.
 
 ## Done (most recent first)
+
+* **The 7B layer is instrumented instead of fitted: it is 96–98% matmul.**
+  `bench_throughput.py --layer-profile` compiles the layer, times it whole, and
+  in the same process times the same seven trit matmuls one by one plus the
+  elementwise work, with means over ten interleaved repetitions. At 1 thread
+  the layer is **23.4–27.9 ms, of which matmul 23.4–26.7 ms and elementwise
+  0.05–0.10 ms**; non-matmul is **1.2–4.7%** across six runs (four threads
+  1.6–4.7%, one run −0.7% i.e. below resolution). That closes lever (a) of the
+  open item: there is no hidden second workload to reclaim. The same
+  instrumentation found the compiled layer ran a **two**-matmul MLP while
+  `[3b]` counted three, inflating `compiled_layer.GMAC` by 29% (202.6M vs
+  157.3M MACs/layer); the layer now runs the real SwiGLU shape (`w1`, `w3`,
+  `w2`) and the two numbers agree. `benchmarks/results.json` regenerated
+  (2026-11-22T21:24Z, host load 1.5): projected **3.78 tok/s**, compiled layer
+  1.6 tok/s in the same run, roofline 14.2 tok/s at 18.8 GB/s.
+
 
 * **`data/corpus.txt` was a scrape of unrelated local project notes.** The
   corpus that the bigram and native-trainer demos read was documentation copied
@@ -129,7 +154,6 @@ per-build caveat in the docs. Evidence: three binaries from one source,
   (`tests/test_train.py`, worst rel 5.1e-4); emitting forward/backward through
   the DSL is still open (`docs/training-framework.md`, phases 2-3).
 
-
 * **A four-token chunk now shares one weight pass across four query rows.**
   `M == 3/4` fell back to the per-row kernel, so a four-token chunk streamed
   the whole matrix once per token; the obvious fix -- four output rows * four
@@ -146,7 +170,6 @@ per-build caveat in the docs. Evidence: three binaries from one source,
   `M == 1` passes with `memcmp` at K = 1003/512/1024/1536 over whole tiles,
   plus a float64 reference; pointing the second row's fetch at the first row's
   bytes makes it fail (`four_rows_matches_gemv FAIL`). Suites 39 → 40 e2e.
-
 
 * **The parallel split was one worker doing everything.** `chunk =
   ceil(n/lanes)` was clamped up to `VELOCE_PAR_GRAIN` (512 *elements*), so any
@@ -260,7 +283,6 @@ per-build caveat in the docs. Evidence: three binaries from one source,
   Honest number: GEMV = 19% of the real 18.7 GB/s peak, i.e. decode-bound.
   New `make bench-roofline` quantifies it: kernel/ceiling = 0.36-0.46x while
   reading 4x fewer bytes than a dense FMA.
-
 
 * Benchmark artefacts regenerated and stamped with `measured_at` (UTC):
   `benchmarks/results.json` (2026-11-16T01:36Z) and
