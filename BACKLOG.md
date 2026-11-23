@@ -83,21 +83,21 @@ single-stream number that matters for a 7B token, and nothing so far has moved
 it: the two-, three- and four-query passes only help when a chunk of tokens is
 decoded together.
 
-### 2. Logit hashes depend on compiler code layout
-
-Recompiling the same generated C against a runtime header whose only textual
-change was dead chunk arithmetic (`noop` variant, identical semantics) moved
-the 275.6M cached-decode hash from `dc987e4dba318be1` to `5e3465d5445b9ecc`
-and the logit sum from 8484.671124 to 8484.672795 (relative difference ~2e-7,
-well inside the 1.3e-6 verify tolerance). `-ffast-math` lets GCC re-contract
-FMAs when inlining changes, so "bit-identical" holds across thread counts and
-repeats *within one build*, which is what the tests check, but not across
-builds. Either pin the contraction (`-ffp-contract=fast` is already implied;
-an explicit `-mfma`/`-fno-tree-vectorize` knob would not help) or state the
-per-build caveat in the docs. Evidence: three binaries from one source,
-`grep CACHED` on each.
-
 ## Done (most recent first)
+
+* **The determinism claim is now scoped to "within a build", with the
+  cross-build caveat stated.** The reference runs are bit-identical across
+  thread counts and repeats *within one compiled binary*, which is what the
+  tests check; across different builds the low bits are not guaranteed because
+  `-O3 -march=native -ffast-math` lets GCC re-contract FMAs when flags or
+  inlining change. Reproduced on the real cached decoder (tiny config
+  D=64/F=128/2 layers, 8 tokens, chunk 2, one thread) by rebuilding the *same*
+  generated C with different codegen flags: default hash `e2a3104fa8ff9791`,
+  `-ffp-contract=off` `cb6e04c321fd25a8`, `-fno-tree-vectorize`
+  `1b6d48fb87ff8408` — three hashes, `det=1` on each, same argmax 65, sums
+  -31.163493 / -31.163508 / -31.163526 (relative difference < 2e-6, well inside
+  the verify tolerance). Documented in `docs/language.md` (determinism bullet)
+  and the `docs/implementation-status.md` NFR row; no test is weakened.
 
 * **A three-token chunk now shares one weight pass across three query rows.**
   `M == 3` fell back to the per-row kernel, so a three-token chunk streamed the

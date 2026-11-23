@@ -149,7 +149,15 @@ Elementwise `+ - * /` work between same-shape tensors, tensor⊕scalar, and
 
 ## Semantics & guarantees
 
-* **Deterministic** — identical inputs produce bit-identical outputs.
+* **Deterministic** — identical inputs produce bit-identical outputs *for a
+  fixed build*. The reference runs are bit-identical across thread counts and
+  repeats within one compiled binary, which is what the tests check. Across
+  *different* builds the floating-point bits are not guaranteed: the build uses
+  `-O3 -march=native -ffast-math`, so changing compiler flags or inlining
+  (even adding dead arithmetic) lets GCC re-contract FMAs and moves the low
+  bits by ~1e-7 relative — well inside the 1e-6 verify tolerance, and it does
+  not change the argmax. Exact bit-for-bit reproduction needs the same source,
+  flags and compiler (see `docs/implementation-status.md`).
 * **Zero heap allocation** — every activation lives in a per-function `static`
   arena sized at compile time; buffers are reused across non-overlapping
   lifetimes.

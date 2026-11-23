@@ -25,7 +25,7 @@ plainly.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| Determinism (bit-identical runs) | ✅ | Verified in `test_e2e_transformer_layer` (runs twice, compares) and `test_parallel_trit_bit_exact` / `test_parallel_matches_serial_transformer` / `test_parallel_row_kernels` (serial vs 1/2/4-thread OpenMP vs C11-threads: identical hashes). |
+| Determinism (bit-identical runs) | ✅ within a build | Verified in `test_e2e_transformer_layer` (runs twice, compares) and `test_parallel_trit_bit_exact` / `test_parallel_matches_serial_transformer` / `test_parallel_row_kernels` (serial vs 1/2/4-thread OpenMP vs C11-threads: identical hashes). **Caveat:** this is per *build*. `-ffast-math` lets GCC re-contract FMAs when inlining or flags change, so two builds of the same source can differ in the low bits (~1e-7 relative, inside the 1e-6 verify tolerance, argmax unchanged) — reproduced on the cached decoder with `-ffp-contract=off` / `-fno-tree-vectorize` (three hashes, `det=1` each). Exact bit-for-bit reproduction needs identical source, flags and compiler. |
 | Minimal toolchain / no runtime deps | ✅ | Runtime is `static inline` header; serial builds link with only libm. Parallel builds use the toolchain's OpenMP (`-fopenmp`) or the C11 `<threads.h>` pool; both are optional and auto-detected. |
 | C ABI interoperability | ✅ | All functions are `veloce_<name>` with C types. |
 | Zero runtime heap allocation | ✅ | Per-function `static` arena; generated C contains no `malloc`/`calloc` (asserted in tests). |
@@ -275,7 +275,7 @@ the capabilities come from the trained model.
 
 | Command | What it proves |
 |---------|----------------|
-| `make test` | 40 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, a lane-coverage test that fails if a fork sends every item to one worker, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one-, two- and four-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
+| `make test` | 41 end-to-end tests (`test_veloce.py`, incl. 4 FR-4.2 thread-consistency tests, a lane-coverage test that fails if a fork sends every item to one worker, numeric coverage for every low-bit kernel, chunked cached-decode mask checks (per-row and garbage-slot), a bit-exactness check between the one-, two-, three- and four-row trit kernels and an `-ffast-math` SiLU saturation regression) + 49 front-end/codegen/packing tests (`test_compiler.py`, incl. 5 for the decoder-module renderer, 5 for the cached-module renderer and 2 guarding the committed benchmark artefact) — compiles and runs real C, checks vs. NumPy. Runs inside an auto-created `.venv` with NumPy installed |
 | `make examples` | `run_transformer.py`: compiled transformer layer matches a NumPy reference (max err ~1e-5) |
 | `make kv` | `run_kv_decode.py`: five tokens decoded into a caller-owned KV cache, per-token and cached-attention outputs match NumPy (max err ~1e-6) |
 | `make train` | `train_tiny_lm.py`: trains a ternary classifier with QAT, packs a `.veloce` (92% ternary params), compiles `tiny_lm_cls.vel`, and mmap-deploys it — 32/32 predictions match NumPy |
